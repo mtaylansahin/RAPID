@@ -165,6 +165,16 @@ def run_evaluate(args):
         if args.global_model_path:
             cmd.extend(['--global_model_path', args.global_model_path])
     
+    # Add prediction saving options
+    if getattr(args, 'save_predictions', False):
+        cmd.append('--save_predictions')
+        if args.predictions_dir:
+            cmd.extend(['--predictions_dir', args.predictions_dir])
+        if getattr(args, 'include_scores', False):
+            cmd.append('--include_scores')
+        if getattr(args, 'include_negative', False):
+            cmd.append('--include_negative')
+    
     print(f"Command: {' '.join(cmd)}\n")
     result = subprocess.run(cmd)
     
@@ -238,6 +248,15 @@ def main():
                               help='Use pretrained global model')
     eval_parser.add_argument('--global_model_path', type=str, default=None,
                               help='Path to global model checkpoint')
+    # Prediction output options
+    eval_parser.add_argument('--save_predictions', action='store_true',
+                              help='Save predicted interactions to text file')
+    eval_parser.add_argument('--predictions_dir', type=str, default='./predictions',
+                              help='Directory to save prediction files')
+    eval_parser.add_argument('--include_scores', action='store_true',
+                              help='Include prediction scores in output file')
+    eval_parser.add_argument('--include_negative', action='store_true',
+                              help='Include negative predictions in output file')
     
     # === All command (full pipeline) ===
     all_parser = subparsers.add_parser(
@@ -278,6 +297,17 @@ def main():
                              help='Evaluation mode')
     all_parser.add_argument('--checkpoint', type=str, default=None,
                              help='Path to model checkpoint (for evaluate only)')
+    # Prediction output options
+    all_parser.add_argument('--save_predictions', action='store_true', default=True,
+                             help='Save predicted interactions to text file (default: True)')
+    all_parser.add_argument('--no_save_predictions', action='store_false', dest='save_predictions',
+                             help='Disable saving predictions to file')
+    all_parser.add_argument('--predictions_dir', type=str, default='./predictions',
+                             help='Directory to save prediction files')
+    all_parser.add_argument('--include_scores', action='store_true',
+                             help='Include prediction scores in output file')
+    all_parser.add_argument('--include_negative', action='store_true',
+                             help='Include negative predictions in output file')
     
     args = parser.parse_args()
     

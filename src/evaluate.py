@@ -3,7 +3,7 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import json
 
 import torch
@@ -63,16 +63,65 @@ class Evaluator:
             self.global_emb = None
         
         self.criterion = get_loss_function(loss_type='focal', gamma=2.0)
+        
+        # Storage for predictions (to save to file)
+        self.predictions: List[Tuple[int, int, int, int, float, int]] = []
+    
+    def save_predictions(
+        self,
+        output_path: Path,
+        include_negative: bool = False,
+        include_scores: bool = False,
+    ) -> None:
+        """
+        Save predicted interactions to a text file.
+        
+        Default format: subject object timestamp (3 columns)
+        Optionally includes prediction scores as 4th column.
+        
+        Args:
+            output_path: Path to save the predictions file
+            include_negative: If True, include negative predictions (non-interactions)
+            include_scores: If True, add prediction probability as 4th column
+        """
+        if not self.predictions:
+            print("Warning: No predictions to save. Run evaluation first.")
+            return
+        
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w') as f:
+            for e1, rel, e2, t, score, pred in self.predictions:
+                # Only save positive predictions unless include_negative is True
+                if pred == 1 or include_negative:
+                    if include_scores:
+                        f.write(f"{e1}\t{e2}\t{t}\t{score:.4f}\n")
+                    else:
+                        f.write(f"{e1}\t{e2}\t{t}\n")
+        
+        num_positive = sum(1 for p in self.predictions if p[5] == 1)
+        num_total = len(self.predictions)
+        print(f"\nPredictions saved to: {output_path}")
+        print(f"  Positive predictions: {num_positive}")
+        if include_negative:
+            print(f"  Total predictions: {num_total}")
     
     @torch.no_grad()
-    def evaluate_teacher_forcing(self) -> ClassificationMetrics:
+    def evaluate_teacher_forcing(self, collect_predictions: bool = False) -> ClassificationMetrics:
         """
         Evaluate with teacher forcing (ground-truth history).
         
         This is the standard evaluation matching training.
+        
+        Args:
+            collect_predictions: If True, store predictions for later saving to file
         """
         self.model.eval()
         metrics_computer = MetricsComputer(threshold=self.threshold)
+        
+        if collect_predictions:
+            self.predictions = []
         
         dataloader = self.data_module.get_test_dataloader()
         
@@ -83,6 +132,7 @@ class Evaluator:
             entity1 = batch['entity1'].to(self.device)
             entity2 = batch['entity2'].to(self.device)
             labels = batch['labels'].to(self.device)
+            timesteps = batch['timesteps']
             
             logits = self.model(
                 entity1_ids=entity1,
@@ -97,17 +147,43 @@ class Evaluator:
             
             loss = self.criterion(logits, labels)
             metrics_computer.update(logits, labels, loss.item())
+            
+            # Collect predictions if requested
+            if collect_predictions:
+                probs = torch.sigmoid(logits).cpu().numpy()
+                preds = (probs >= self.threshold).astype(int)
+                e1_np = entity1.cpu().numpy()
+                e2_np = entity2.cpu().numpy()
+                t_np = timesteps.numpy()
+                
+                for i in range(len(e1_np)):
+                    # Format: (subject, relation, object, timestamp, score, prediction)
+                    # Using relation=1 as default (interaction)
+                    self.predictions.append((
+                        int(e1_np[i]),
+                        1,  # relation (interaction)
+                        int(e2_np[i]),
+                        int(t_np[i]),
+                        float(probs[i]),
+                        int(preds[i])
+                    ))
         
         return metrics_computer.compute()
     
     @torch.no_grad()
-    def evaluate_autoregressive(self) -> ClassificationMetrics:
+    def evaluate_autoregressive(self, collect_predictions: bool = False) -> ClassificationMetrics:
         """
         Evaluate autoregressively (predicted history).
         
         This simulates true inference where we don't know future interactions.
+        
+        Args:
+            collect_predictions: If True, store predictions for later saving to file
         """
         self.model.eval()
+        
+        if collect_predictions:
+            self.predictions = []
         
         # Initialize model with training history
         self.model.reset_inference_state()
@@ -163,6 +239,24 @@ class Evaluator:
                 
                 all_logits.append(logits.cpu())
                 all_labels.append(labels.cpu())
+                
+                # Collect predictions if requested
+                if collect_predictions:
+                    probs_np = probs.cpu().numpy()
+                    preds_np = preds.cpu().numpy()
+                    e1_np = entity1.cpu().numpy()
+                    e2_np = entity2.cpu().numpy()
+                    
+                    for j in range(len(e1_np)):
+                        # Format: (subject, relation, object, timestamp, score, prediction)
+                        self.predictions.append((
+                            int(e1_np[j]),
+                            1,  # relation (interaction)
+                            int(e2_np[j]),
+                            int(t),
+                            float(probs_np[j]),
+                            int(preds_np[j])
+                        ))
         
         # Compute metrics
         all_logits = torch.cat(all_logits)
@@ -257,6 +351,70 @@ class Evaluator:
                       f"early AUPRC {early:.4f} vs late {late:.4f}")
         
         return results
+    
+    def full_evaluation_with_predictions(
+        self,
+        output_dir: Optional[Path] = None,
+        include_scores: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Run full evaluation and save predictions to file.
+        
+        Args:
+            output_dir: Directory to save predictions (default: ./predictions/)
+            include_scores: If True, include prediction scores in output
+            
+        Returns:
+            Dictionary with all evaluation results
+        """
+        results = {}
+        
+        # Teacher forcing evaluation with predictions
+        tf_metrics = self.evaluate_teacher_forcing(collect_predictions=True)
+        results['teacher_forcing'] = tf_metrics.to_dict()
+        print(f"\nTeacher Forcing Results:")
+        print(f"  {tf_metrics}")
+        
+        # Save teacher forcing predictions
+        if output_dir is None:
+            output_dir = Path('./predictions')
+        output_dir = Path(output_dir)
+        
+        self.save_predictions(
+            output_dir / 'predictions_teacher_forcing.txt',
+            include_negative=False,
+            include_scores=include_scores,
+        )
+        
+        # Autoregressive evaluation with predictions
+        ar_metrics = self.evaluate_autoregressive(collect_predictions=True)
+        results['autoregressive'] = ar_metrics.to_dict()
+        print(f"\nAutoregressive Results:")
+        print(f"  {ar_metrics}")
+        
+        # Save autoregressive predictions
+        self.save_predictions(
+            output_dir / 'predictions_autoregressive.txt',
+            include_negative=False,
+            include_scores=include_scores,
+        )
+        
+        # Per-timestep analysis
+        per_ts_metrics = self.evaluate_per_timestep()
+        results['per_timestep'] = per_ts_metrics.to_dict()
+        print(f"\nPer-Timestep Analysis:")
+        print(f"  Mean AUPRC: {per_ts_metrics.mean_auprc:.4f}")
+        print(f"  Mean F1: {per_ts_metrics.mean_f1:.4f}")
+        
+        # Check for temporal degradation
+        if len(per_ts_metrics.auprcs) > 5:
+            early = np.mean(per_ts_metrics.auprcs[:5])
+            late = np.mean(per_ts_metrics.auprcs[-5:])
+            if late < early * 0.9:
+                print(f"  ⚠️ Temporal degradation detected: "
+                      f"early AUPRC {early:.4f} vs late {late:.4f}")
+        
+        return results
 
 
 def load_model(
@@ -315,6 +473,16 @@ def main():
     parser.add_argument('--mode', type=str, default='all',
                         choices=['all', 'teacher_forcing', 'autoregressive', 'per_timestep'],
                         help='Evaluation mode')
+    
+    # Prediction output options
+    parser.add_argument('--save_predictions', action='store_true',
+                        help='Save predicted interactions to text file')
+    parser.add_argument('--predictions_dir', type=str, default='./predictions',
+                        help='Directory to save prediction files')
+    parser.add_argument('--include_scores', action='store_true',
+                        help='Include prediction scores in output file')
+    parser.add_argument('--include_negative', action='store_true',
+                        help='Include negative predictions in output file')
     
     args = parser.parse_args()
     
@@ -380,17 +548,38 @@ def main():
         global_model=global_model,
     )
     
+    # Prepare predictions directory if saving predictions
+    predictions_dir = Path(args.predictions_dir) / args.dataset if args.save_predictions else None
+    
     # Run evaluation
     if args.mode == 'all':
-        results = evaluator.full_evaluation()
+        if args.save_predictions:
+            results = evaluator.full_evaluation_with_predictions(
+                output_dir=predictions_dir,
+                include_scores=args.include_scores,
+            )
+        else:
+            results = evaluator.full_evaluation()
     elif args.mode == 'teacher_forcing':
-        metrics = evaluator.evaluate_teacher_forcing()
+        metrics = evaluator.evaluate_teacher_forcing(collect_predictions=args.save_predictions)
         results = {'teacher_forcing': metrics.to_dict()}
         print(f"\n{metrics}")
+        if args.save_predictions:
+            evaluator.save_predictions(
+                predictions_dir / 'predictions_teacher_forcing.txt',
+                include_negative=args.include_negative,
+                include_scores=args.include_scores,
+            )
     elif args.mode == 'autoregressive':
-        metrics = evaluator.evaluate_autoregressive()
+        metrics = evaluator.evaluate_autoregressive(collect_predictions=args.save_predictions)
         results = {'autoregressive': metrics.to_dict()}
         print(f"\n{metrics}")
+        if args.save_predictions:
+            evaluator.save_predictions(
+                predictions_dir / 'predictions_autoregressive.txt',
+                include_negative=args.include_negative,
+                include_scores=args.include_scores,
+            )
     elif args.mode == 'per_timestep':
         per_ts = evaluator.evaluate_per_timestep()
         results = {'per_timestep': per_ts.to_dict()}
