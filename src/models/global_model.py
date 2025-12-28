@@ -141,9 +141,28 @@ class GlobalRGCNAggregator(nn.Module):
         else:
             node_features = ent_embeds[:batched_graph.num_nodes()]
         
-        # Run RGCN
+        # Handle device - move graph and features to RGCN device
+        device = ent_embeds.device
+        rgcn_device = next(self.rgcn.parameters()).device
+        
+        # Move graph to RGCN device (works when DGL has CUDA support)
+        if batched_graph.device != rgcn_device:
+            try:
+                batched_graph = batched_graph.to(rgcn_device)
+            except Exception:
+                pass  # DGL doesn't support CUDA, keep on CPU
+        
+        # Move features to RGCN's device
+        if rgcn_device != device:
+            node_features = node_features.to(rgcn_device)
+        
         updated_features = self.rgcn(batched_graph, node_features)
-        batched_graph.ndata['h'] = updated_features
+        
+        # Move results back to model device
+        if rgcn_device != device:
+            updated_features = updated_features.to(device)
+        
+        batched_graph.ndata['h'] = updated_features.to(batched_graph.device)
         
         # Pool each graph to single vector
         if self.pooling == 'max':
@@ -221,8 +240,26 @@ class GlobalRGCNAggregator(nn.Module):
         else:
             node_features = ent_embeds[:batched_graph.num_nodes()]
         
+        # Handle device - move graph and features to RGCN device
+        device = ent_embeds.device
+        rgcn_device = next(self.rgcn.parameters()).device
+        
+        # Move graph to RGCN device (works when DGL has CUDA support)
+        if batched_graph.device != rgcn_device:
+            try:
+                batched_graph = batched_graph.to(rgcn_device)
+            except Exception:
+                pass  # DGL doesn't support CUDA, keep on CPU
+        
+        if rgcn_device != device:
+            node_features = node_features.to(rgcn_device)
+        
         updated_features = self.rgcn(batched_graph, node_features)
-        batched_graph.ndata['h'] = updated_features
+        
+        if rgcn_device != device:
+            updated_features = updated_features.to(device)
+        
+        batched_graph.ndata['h'] = updated_features.to(batched_graph.device)
         
         if self.pooling == 'max':
             global_info = dgl.max_nodes(batched_graph, 'h')
@@ -295,6 +332,33 @@ class PPIGlobalModel(nn.Module):
         
         # Precomputed global embeddings
         self.global_emb: Optional[Dict[int, torch.Tensor]] = None
+        
+        # Check if DGL supports CUDA
+        self._dgl_has_cuda = self._check_dgl_cuda_support()
+    
+    def _check_dgl_cuda_support(self) -> bool:
+        """Check if DGL supports CUDA operations."""
+        try:
+            test_g = dgl.graph(([0], [1]))
+            if torch.cuda.is_available():
+                test_g.to('cuda:0')
+            return True
+        except Exception:
+            return False
+    
+    def to(self, device, *args, **kwargs):
+        """Override to keep RGCN on CPU if DGL doesn't support CUDA."""
+        result = super().to(device, *args, **kwargs)
+        if not self._dgl_has_cuda and 'cuda' in str(device):
+            self.aggregator.rgcn = self.aggregator.rgcn.to('cpu')
+        return result
+    
+    def cuda(self, device=None):
+        """Override to keep RGCN on CPU if DGL doesn't support CUDA."""
+        result = super().cuda(device)
+        if not self._dgl_has_cuda:
+            self.aggregator.rgcn = self.aggregator.rgcn.to('cpu')
+        return result
     
     def forward(
         self,

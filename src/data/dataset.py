@@ -306,6 +306,8 @@ class PPIDataModule:
             batch_size=self.batch_size,
             shuffle=shuffle,
             collate_fn=self._collate_fn,
+            num_workers=0,  # History lookup requires main process
+            pin_memory=True,
         )
     
     def get_val_dataloader(self):
@@ -319,6 +321,8 @@ class PPIDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             collate_fn=self._collate_fn,
+            num_workers=0,
+            pin_memory=True,
         )
     
     def get_test_dataloader(self):
@@ -331,6 +335,8 @@ class PPIDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             collate_fn=self._collate_fn,
+            num_workers=0,
+            pin_memory=True,
         )
     
     def _collate_fn(self, batch: List[Dict]) -> Dict:

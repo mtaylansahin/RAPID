@@ -97,6 +97,9 @@ class RAPIDModel(nn.Module):
         
         self.dropout = nn.Dropout(config.dropout)
         
+        # Check if DGL supports CUDA
+        self._dgl_has_cuda = self._check_dgl_cuda_support()
+        
         # === State for autoregressive inference ===
         # History per entity: list of (neighbors, rel_types, timestep)
         self._entity_history: List[List[Dict]] = []
@@ -113,10 +116,58 @@ class RAPIDModel(nn.Module):
         
         # Current timestep being processed
         self._latest_time: Optional[int] = None
+        
+        # Cache for RGCN outputs per timestep (cleared each forward pass)
+        self._rgcn_cache: Dict[int, torch.Tensor] = {}
     
     def _canonical_edge(self, e1: int, e2: int) -> Tuple[int, int]:
         """Return edge in canonical order (smaller id first)."""
         return (min(e1, e2), max(e1, e2))
+    
+    def _get_node_idx(self, g: dgl.DGLGraph, entity_id: int) -> Optional[int]:
+        """Get the local node index for an entity in a graph, or None if not present."""
+        if hasattr(g, 'ids') and g.ids is not None:
+            # Legacy custom attribute
+            if entity_id in g.ids:
+                return g.ids[entity_id]
+            return None
+        elif 'id' in g.ndata:
+            # Standard ndata approach
+            node_ids = g.ndata['id'].view(-1).tolist()
+            if entity_id in node_ids:
+                return node_ids.index(entity_id)
+            return None
+        else:
+            # Assume identity mapping
+            if entity_id < g.num_nodes():
+                return entity_id
+            return None
+    
+    def _check_dgl_cuda_support(self) -> bool:
+        """Check if DGL supports CUDA operations."""
+        try:
+            # Create a small test graph and try to move it to CUDA
+            test_g = dgl.graph(([0], [1]))
+            if torch.cuda.is_available():
+                test_g.to('cuda:0')
+            return True
+        except Exception:
+            return False
+    
+    def to(self, device, *args, **kwargs):
+        """Override to keep RGCN on CPU if DGL doesn't support CUDA."""
+        result = super().to(device, *args, **kwargs)
+        # If DGL doesn't support CUDA, keep RGCN on CPU
+        if not self._dgl_has_cuda and 'cuda' in str(device):
+            self.rgcn = self.rgcn.to('cpu')
+        return result
+    
+    def cuda(self, device=None):
+        """Override to keep RGCN on CPU if DGL doesn't support CUDA."""
+        result = super().cuda(device)
+        if not self._dgl_has_cuda:
+            self.rgcn = self.rgcn.to('cpu')
+        return result
     
     def reset_inference_state(self) -> None:
         """Reset all inference state. Call before starting new inference run."""
@@ -174,30 +225,42 @@ class RAPIDModel(nn.Module):
         # Build sequence tensor
         seq_len = len(history)
         embed_dim = 4 * self.hidden_dim
-        seq_tensor = torch.zeros(1, seq_len, embed_dim, device=self.entity_embeds.device)
+        device = self.entity_embeds.device
+        seq_tensor = torch.zeros(1, seq_len, embed_dim, device=device)
+        
+        # Pre-compute mean relation embedding
+        mean_rel = self.rel_embeds.mean(dim=0)
         
         for i, (hist_entry, t) in enumerate(zip(history, history_t)):
-            # Get RGCN-enhanced embedding if graph exists
-            if t in self._graph_dict:
+            # Check cache first, then compute if needed
+            if t in self._rgcn_cache:
+                node_features = self._rgcn_cache[t]
                 g = self._graph_dict[t]
-                # Check if node_ids are stored in ndata
-                if 'id' in g.ndata:
-                    node_features = self.entity_embeds[g.ndata['id'].view(-1)]
+                node_idx = self._get_node_idx(g, entity_id)
+                if node_idx is not None:
+                    entity_rgcn_embed = node_features[node_idx]
                 else:
-                    node_features = self.entity_embeds[:g.num_nodes()]
-                node_features = self.rgcn(g, node_features)
-                
-                # Check if entity is in this graph
-                # Use ndata['id'] mapping or assume identity mapping
+                    entity_rgcn_embed = self.entity_embeds[entity_id]
+            elif t in self._graph_dict:
+                g = self._graph_dict[t]
+                rgcn_device = next(self.rgcn.parameters()).device
+                # Move graph to RGCN device if DGL supports CUDA
+                if self._dgl_has_cuda and g.device != rgcn_device:
+                    g = g.to(rgcn_device)
                 if 'id' in g.ndata:
-                    node_ids = g.ndata['id'].view(-1).tolist()
-                    if entity_id in node_ids:
-                        local_idx = node_ids.index(entity_id)
-                        entity_rgcn_embed = node_features[local_idx]
-                    else:
-                        entity_rgcn_embed = self.entity_embeds[entity_id]
-                elif entity_id < g.num_nodes():
-                    entity_rgcn_embed = node_features[entity_id]
+                    node_features = self.entity_embeds[g.ndata['id'].view(-1)].to(rgcn_device)
+                else:
+                    node_features = self.entity_embeds[:g.num_nodes()].to(rgcn_device)
+                node_features = self.rgcn(g, node_features)
+                if rgcn_device != device:
+                    node_features = node_features.to(device)
+                
+                # Cache the result
+                self._rgcn_cache[t] = node_features
+                
+                node_idx = self._get_node_idx(g, entity_id)
+                if node_idx is not None:
+                    entity_rgcn_embed = node_features[node_idx]
                 else:
                     entity_rgcn_embed = self.entity_embeds[entity_id]
             else:
@@ -207,10 +270,7 @@ class RAPIDModel(nn.Module):
             if t in self._global_emb:
                 global_embed = self._global_emb[t]
             else:
-                global_embed = torch.zeros(self.hidden_dim, device=self.entity_embeds.device)
-            
-            # Mean relation embedding
-            mean_rel = self.rel_embeds.mean(dim=0)
+                global_embed = torch.zeros(self.hidden_dim, device=device)
             
             seq_tensor[0, i] = torch.cat([
                 entity_rgcn_embed,
@@ -260,34 +320,27 @@ class RAPIDModel(nn.Module):
         batch_size = len(entity1_ids)
         device = self.entity_embeds.device
         
+        # Clear RGCN cache for this forward pass
+        self._rgcn_cache = {}
+        
+        # Pre-compute RGCN outputs for all timesteps needed in this batch
+        all_timesteps = set()
+        for hist_t in entity1_history_t + entity2_history_t:
+            all_timesteps.update(hist_t[-self.seq_len:])
+        
+        self._precompute_rgcn(all_timesteps, graph_dict)
+        
         # Get entity embeddings
         entity1_embed = self.entity_embeds[entity1_ids]
         entity2_embed = self.entity_embeds[entity2_ids]
         
-        # Get temporal embeddings from history
-        entity1_temporal = torch.zeros(batch_size, self.hidden_dim, device=device)
-        entity2_temporal = torch.zeros(batch_size, self.hidden_dim, device=device)
-        
-        for i in range(batch_size):
-            # Process entity1 history
-            if len(entity1_history[i]) > 0:
-                entity1_temporal[i] = self._encode_history(
-                    entity1_ids[i].item(),
-                    entity1_history[i],
-                    entity1_history_t[i],
-                    graph_dict,
-                    global_emb,
-                )
-            
-            # Process entity2 history
-            if len(entity2_history[i]) > 0:
-                entity2_temporal[i] = self._encode_history(
-                    entity2_ids[i].item(),
-                    entity2_history[i],
-                    entity2_history_t[i],
-                    graph_dict,
-                    global_emb,
-                )
+        # Batch encode temporal embeddings
+        entity1_temporal = self._encode_history_batch(
+            entity1_ids, entity1_history, entity1_history_t, graph_dict, global_emb
+        )
+        entity2_temporal = self._encode_history_batch(
+            entity2_ids, entity2_history, entity2_history_t, graph_dict, global_emb
+        )
         
         # Apply dropout
         entity1_embed = self.dropout(entity1_embed)
@@ -302,6 +355,110 @@ class RAPIDModel(nn.Module):
         )
         
         return logits
+    
+    def _precompute_rgcn(self, timesteps: Set[int], graph_dict: Dict[int, dgl.DGLGraph]) -> None:
+        """Pre-compute RGCN outputs for all needed timesteps."""
+        device = self.entity_embeds.device
+        rgcn_device = next(self.rgcn.parameters()).device
+        
+        for t in timesteps:
+            if t in self._rgcn_cache:
+                continue
+            if t not in graph_dict:
+                continue
+            
+            g = graph_dict[t]
+            # Move graph to RGCN device if DGL supports CUDA
+            if self._dgl_has_cuda and g.device != rgcn_device:
+                g = g.to(rgcn_device)
+            node_features = self.entity_embeds[g.ndata['id'].view(-1)].to(rgcn_device)
+            node_features = self.rgcn(g, node_features)
+            
+            if rgcn_device != device:
+                node_features = node_features.to(device)
+            
+            self._rgcn_cache[t] = node_features
+    
+    def _encode_history_batch(
+        self,
+        entity_ids: torch.Tensor,
+        histories: List[List[Dict]],
+        histories_t: List[List[int]],
+        graph_dict: Dict[int, dgl.DGLGraph],
+        global_emb: Optional[Dict[int, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Encode histories for a batch of entities."""
+        batch_size = len(entity_ids)
+        device = self.entity_embeds.device
+        embed_dim = 4 * self.hidden_dim
+        
+        # Find max sequence length in batch
+        seq_lens = [min(len(h), self.seq_len) for h in histories]
+        max_seq_len = max(seq_lens) if seq_lens else 0
+        
+        if max_seq_len == 0:
+            return torch.zeros(batch_size, self.hidden_dim, device=device)
+        
+        # Pre-compute mean relation embedding (same for all)
+        mean_rel = self.rel_embeds.mean(dim=0)
+        
+        # Build padded sequence tensor
+        seq_tensor = torch.zeros(batch_size, max_seq_len, embed_dim, device=device)
+        actual_lens = []
+        
+        for b in range(batch_size):
+            history = histories[b][-self.seq_len:]
+            history_t = histories_t[b][-self.seq_len:]
+            seq_len = len(history)
+            actual_lens.append(seq_len)
+            
+            if seq_len == 0:
+                continue
+            
+            entity_id = entity_ids[b].item()
+            
+            for i, (hist_entry, t) in enumerate(zip(history, history_t)):
+                # Get RGCN embedding from cache
+                if t in self._rgcn_cache and t in graph_dict:
+                    g = graph_dict[t]
+                    node_features = self._rgcn_cache[t]
+                    node_idx = self._get_node_idx(g, entity_id)
+                    if node_idx is not None:
+                        entity_rgcn_embed = node_features[node_idx]
+                    else:
+                        entity_rgcn_embed = self.entity_embeds[entity_id]
+                else:
+                    entity_rgcn_embed = self.entity_embeds[entity_id]
+                
+                # Global embedding
+                if global_emb and t in global_emb:
+                    g_emb = global_emb[t]
+                else:
+                    g_emb = torch.zeros(self.hidden_dim, device=device)
+                
+                seq_tensor[b, i] = torch.cat([
+                    entity_rgcn_embed,
+                    self.entity_embeds[entity_id],
+                    mean_rel,
+                    g_emb,
+                ])
+        
+        # Handle all-zero sequences
+        actual_lens = torch.LongTensor([max(l, 1) for l in actual_lens])
+        
+        # Pack and encode in batch
+        packed = torch.nn.utils.rnn.pack_padded_sequence(
+            seq_tensor, actual_lens.cpu(), batch_first=True, enforce_sorted=False
+        )
+        
+        temporal_embeds = self.temporal_encoder(packed)
+        
+        # Zero out embeddings for entities with no history
+        for b in range(batch_size):
+            if seq_lens[b] == 0:
+                temporal_embeds[b] = 0
+        
+        return temporal_embeds
     
     def _encode_history(
         self,
@@ -324,11 +481,17 @@ class RAPIDModel(nn.Module):
         for i, (hist_entry, t) in enumerate(zip(history, history_t)):
             if t in graph_dict:
                 g = graph_dict[t]
-                node_features = self.entity_embeds[g.ndata['id'].view(-1)]
+                rgcn_device = next(self.rgcn.parameters()).device
+                # Move features to RGCN's device for computation
+                node_features = self.entity_embeds[g.ndata['id'].view(-1)].to(rgcn_device)
                 node_features = self.rgcn(g, node_features)
+                # Move results back to model device
+                if rgcn_device != device:
+                    node_features = node_features.to(device)
                 
-                if entity_id in g.ids:
-                    entity_rgcn_embed = node_features[g.ids[entity_id]]
+                node_idx = self._get_node_idx(g, entity_id)
+                if node_idx is not None:
+                    entity_rgcn_embed = node_features[node_idx]
                 else:
                     entity_rgcn_embed = self.entity_embeds[entity_id]
             else:
