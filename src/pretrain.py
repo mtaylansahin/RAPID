@@ -13,9 +13,6 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from src.models.global_model import PPIGlobalModel, create_global_model
 from src.data.dataset import PPIDataModule
 from src.config import ModelConfig
@@ -229,6 +226,122 @@ def pretrain(args):
     print(f"Best loss: {best_loss:.4f}")
     print(f"Model saved to: {model_file}")
     print(f"{'='*60}")
+
+
+def train_global_model(
+    model,
+    data_module,
+    device,
+    epochs: int = 30,
+    lr: float = 1e-3,
+    output_path: Path = None,
+    batch_size: int = 64,
+    weight_decay: float = 1e-5,
+    grad_norm: float = 1.0,
+):
+    """
+    Train the global model (callable from main.py).
+    
+    Args:
+        model: Global model to train
+        data_module: Data module with training data
+        device: Torch device
+        epochs: Number of training epochs
+        lr: Learning rate
+        output_path: Path to save model checkpoint
+        batch_size: Training batch size
+        weight_decay: L2 regularization
+        grad_norm: Gradient clipping norm
+    """
+    import time
+    
+    print(f"\nEntities: {data_module.num_entities}")
+    print(f"Relations: {data_module.num_rels}")
+    print(f"Train timesteps: {len(data_module.train_times)}")
+    
+    # Setup optimizer
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    
+    # Compute true distributions for training
+    print("\nComputing entity distributions...")
+    train_data = data_module.train_data
+    timesteps = sorted(data_module.train_times)
+    e1_probs, e2_probs = get_true_distribution(
+        train_data, data_module.num_entities, timesteps
+    )
+    
+    # Setup checkpointing
+    if output_path is None:
+        output_path = Path(f'./models/{data_module.dataset}/global.pth')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Training loop
+    best_loss = float('inf')
+    
+    print("\nStarting training...")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0
+        n_batches = 0
+        
+        t0 = time.time()
+        
+        pbar = tqdm(
+            make_batch(timesteps, e1_probs, e2_probs, batch_size),
+            total=len(timesteps) // batch_size + 1,
+            desc=f"Epoch {epoch:03d}",
+        )
+        
+        for batch_t, batch_e1, batch_e2 in pbar:
+            batch_t = batch_t.to(device)
+            batch_e1 = batch_e1.to(device)
+            batch_e2 = batch_e2.to(device)
+            
+            # Forward pass for both entity predictions
+            loss_e1 = model(batch_t, batch_e1, data_module.graph_dict)
+            loss_e2 = model(batch_t, batch_e2, data_module.graph_dict)
+            loss = (loss_e1 + loss_e2) / 2
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm)
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            n_batches += 1
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        # Compute global embeddings
+        model.eval()
+        with torch.no_grad():
+            global_emb = model.compute_global_embeddings(timesteps, data_module.graph_dict)
+        
+        elapsed = time.time() - t0
+        avg_loss = epoch_loss / n_batches
+        
+        print(f"Epoch {epoch:03d} | Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s")
+        
+        # Save if best
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            print(f"  -> New best! Saving to {output_path}")
+            torch.save({
+                'state_dict': model.state_dict(),
+                'global_emb': {k: v.cpu() for k, v in global_emb.items()},
+                'config': {
+                    'num_entities': data_module.num_entities,
+                    'num_rels': data_module.num_rels,
+                    'hidden_dim': model.hidden_dim,
+                },
+            }, output_path)
+    
+    print(f"\nPretraining complete! Best loss: {best_loss:.4f}")
+    print(f"Model saved to: {output_path}")
 
 
 def main():

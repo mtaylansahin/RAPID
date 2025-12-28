@@ -8,8 +8,8 @@ from typing import Dict, List, Tuple, Optional, Set
 import pickle
 import dgl
 
-from .sampler import NegativeSampler
-from ..models.rgcn import build_undirected_graph
+from src.data.sampler import NegativeSampler
+from src.models.rgcn import build_undirected_graph
 
 
 class PPIDataset(Dataset):

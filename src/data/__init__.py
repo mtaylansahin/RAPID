@@ -1,11 +1,4 @@
 """Data loading, preprocessing, and negative sampling for PPI dynamics."""
 
-from .dataset import PPIDataset, PPIDataModule
-from .sampler import NegativeSampler, BatchNegativeSampler
-
-__all__ = [
-    'PPIDataset',
-    'PPIDataModule',
-    'NegativeSampler',
-    'BatchNegativeSampler',
-]
+# Imports are done directly from submodules to avoid circular import issues
+# Example: from src.data.dataset import PPIDataset, PPIDataModule

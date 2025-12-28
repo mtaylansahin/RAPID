@@ -10,8 +10,6 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from src.config import ModelConfig
 from src.models.rapid import RAPIDModel, create_model
 from src.models.global_model import PPIGlobalModel, create_global_model

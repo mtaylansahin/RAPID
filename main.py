@@ -26,10 +26,14 @@ Examples:
 """
 
 import argparse
-import subprocess
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
+
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).parent.absolute()
+sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def get_base_args():
@@ -61,29 +65,66 @@ def run_pretrain(args):
     print("Stage 1: Pretraining Global Model")
     print("="*60)
     
-    cmd = [
-        sys.executable, 'src/pretrain.py',
-        '--dataset', args.dataset,
-        '--hidden_dim', str(args.hidden_dim),
-        '--seq_len', str(args.seq_len),
-        '--num_bases', str(args.num_bases),
-        '--dropout', str(args.dropout),
-        '--epochs', str(args.pretrain_epochs),
-        '--batch_size', str(args.batch_size),
-        '--lr', str(args.pretrain_lr),
-        '--pooling', args.pooling,
-        '--gpu', str(args.gpu),
-        '--seed', str(args.seed),
-    ]
+    # Import here to avoid import errors at module load time
+    import numpy as np
+    import torch
+    from src.models.global_model import create_global_model
+    from src.data.dataset import PPIDataModule
+    from src.pretrain import train_global_model
     
-    print(f"Command: {' '.join(cmd)}\n")
-    result = subprocess.run(cmd)
+    # Set random seeds
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.gpu >= 0 and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     
-    if result.returncode != 0:
-        print("Error: Pretraining failed!")
-        sys.exit(1)
+    # Setup device
+    device = torch.device('cpu')
+    if args.gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
+        torch.cuda.set_device(args.gpu)
     
-    return result.returncode == 0
+    print(f"Using device: {device}")
+    
+    # Load data
+    data_path = Path('./data') / args.dataset
+    print(f"\nLoading dataset: {args.dataset}")
+    data_module = PPIDataModule(
+        data_path=data_path,
+        batch_size=args.batch_size,
+        neg_ratio=1.0,
+        seed=args.seed,
+    )
+    
+    # Create global model
+    print(f"\nCreating global RGCN model...")
+    model = create_global_model(
+        num_entities=data_module.num_entities,
+        num_rels=data_module.num_rels,
+        hidden_dim=args.hidden_dim,
+        num_bases=args.num_bases,
+        seq_len=args.seq_len,
+        pooling=args.pooling,
+    )
+    model = model.to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Train
+    output_dir = Path('./models') / args.dataset
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f'{args.pooling}_global.pth'
+    
+    train_global_model(
+        model=model,
+        data_module=data_module,
+        device=device,
+        epochs=args.pretrain_epochs,
+        lr=args.pretrain_lr,
+        output_path=output_path,
+    )
+    
+    return True
 
 
 def run_train(args):
@@ -92,38 +133,124 @@ def run_train(args):
     print("Stage 2: Training Main Model")
     print("="*60)
     
-    cmd = [
-        sys.executable, 'src/train.py',
-        '--dataset', args.dataset,
-        '--hidden_dim', str(args.hidden_dim),
-        '--seq_len', str(args.seq_len),
-        '--dropout', str(args.dropout),
-        '--epochs', str(args.epochs),
-        '--batch_size', str(args.batch_size),
-        '--lr', str(args.lr),
-        '--neg_ratio', str(args.neg_ratio),
-        '--focal_gamma', str(args.focal_gamma),
-        '--patience', str(args.patience),
-        '--gpu', str(args.gpu),
-        '--seed', str(args.seed),
-    ]
+    # Import here to avoid import errors at module load time
+    import numpy as np
+    import torch
+    from src.config import DataConfig, ModelConfig, TrainingConfig
+    from src.models.rapid import create_model
+    from src.models.global_model import create_global_model
+    from src.data.dataset import PPIDataModule
+    from src.train import Trainer
     
+    # Set random seeds
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.gpu >= 0 and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Create configs
+    data_config = DataConfig(
+        dataset=args.dataset,
+        data_dir=Path('./data'),
+        neg_ratio=args.neg_ratio,
+        batch_size=args.batch_size,
+    )
+    
+    model_config = ModelConfig(
+        hidden_dim=args.hidden_dim,
+        seq_len=args.seq_len,
+        dropout=args.dropout,
+    )
+    
+    training_config = TrainingConfig(
+        learning_rate=args.lr,
+        max_epochs=args.epochs,
+        patience=args.patience,
+        focal_gamma=args.focal_gamma,
+        gpu=args.gpu,
+        seed=args.seed,
+    )
+    
+    # Setup paths
+    checkpoint_dir = Path('./checkpoints') / args.experiment_name
+    log_dir = Path('./logs') / args.experiment_name
+    
+    # Setup device
+    device = torch.device('cpu')
+    if args.gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
+        torch.cuda.set_device(args.gpu)
+    
+    print(f"Using device: {device}")
+    
+    # Load data
+    print(f"\nLoading dataset: {args.dataset}")
+    data_module = PPIDataModule(
+        data_path=data_config.dataset_path,
+        batch_size=data_config.batch_size,
+        neg_ratio=data_config.neg_ratio,
+        temporal_neg_ratio=data_config.temporal_neg_ratio,
+        seed=args.seed,
+    )
+    
+    # Create model
+    print(f"\nCreating model...")
+    model = create_model(
+        num_entities=data_module.num_entities,
+        num_rels=data_module.num_rels,
+        config=model_config,
+    )
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Load global model if specified
+    global_model = None
     if args.use_global_model:
-        cmd.append('--use_global_model')
         if args.global_model_path:
-            cmd.extend(['--global_model_path', args.global_model_path])
+            global_model_path = Path(args.global_model_path)
+        else:
+            global_model_path = Path(f'./models/{args.dataset}/max_global.pth')
+        
+        if global_model_path.exists():
+            print(f"\nLoading global model from: {global_model_path}")
+            checkpoint = torch.load(global_model_path, map_location=device)
+            
+            gm_config = checkpoint.get('config', {})
+            global_model = create_global_model(
+                num_entities=data_module.num_entities,
+                num_rels=data_module.num_rels,
+                hidden_dim=gm_config.get('hidden_dim', args.hidden_dim),
+                num_bases=gm_config.get('num_bases', 5),
+                seq_len=gm_config.get('seq_len', args.seq_len),
+                pooling=gm_config.get('pooling', 'max'),
+            )
+            global_model.load_state_dict(checkpoint['state_dict'])
+            global_model.global_emb = checkpoint.get('global_emb', {})
+            print(f"  Global embeddings loaded for {len(global_model.global_emb)} timesteps")
+        else:
+            print(f"\nWarning: Global model path not found: {global_model_path}")
+            print("  Training without global model.")
     
-    if args.experiment_name:
-        cmd.extend(['--experiment_name', args.experiment_name])
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        data_module=data_module,
+        config=training_config,
+        device=device,
+        checkpoint_dir=checkpoint_dir,
+        log_dir=log_dir,
+        global_model=global_model,
+    )
     
-    print(f"Command: {' '.join(cmd)}\n")
-    result = subprocess.run(cmd)
+    # Train
+    result = trainer.train()
     
-    if result.returncode != 0:
-        print("Error: Training failed!")
-        sys.exit(1)
+    print(f"\nTraining complete!")
+    print(f"  Best epoch: {result['best_epoch']}")
+    print(f"  Best AUPRC: {result['best_val_auprc']:.4f}")
+    print(f"  Optimal threshold: {result['optimal_threshold']:.3f}")
     
-    return result.returncode == 0
+    return True
 
 
 def run_evaluate(args):
@@ -132,10 +259,17 @@ def run_evaluate(args):
     print("Stage 3: Evaluation")
     print("="*60)
     
+    # Import here to avoid import errors at module load time
+    import torch
+    from src.config import ModelConfig
+    from src.models.rapid import create_model
+    from src.models.global_model import create_global_model
+    from src.data.dataset import PPIDataModule
+    from src.evaluate import Evaluator
+    
     # Find checkpoint if not specified
     checkpoint_path = args.checkpoint
     if not checkpoint_path:
-        # Look for most recent checkpoint
         checkpoint_dir = Path('./checkpoints')
         if checkpoint_dir.exists():
             experiment_dirs = sorted(
@@ -152,33 +286,110 @@ def run_evaluate(args):
         print("Error: No checkpoint found. Please specify --checkpoint")
         sys.exit(1)
     
-    cmd = [
-        sys.executable, 'src/evaluate.py',
-        '--checkpoint', checkpoint_path,
-        '--dataset', args.dataset,
-        '--mode', args.eval_mode,
-        '--gpu', str(args.gpu),
-    ]
+    # Setup device
+    device = torch.device('cpu')
+    if args.gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
     
+    print(f"Using device: {device}")
+    
+    # Load data
+    data_path = Path('./data') / args.dataset
+    print(f"\nLoading dataset: {args.dataset}")
+    data_module = PPIDataModule(
+        data_path=data_path,
+        batch_size=128,
+        neg_ratio=1.0,
+    )
+    
+    # Load model
+    print(f"\nLoading model from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    if 'config' in checkpoint and 'model' in checkpoint['config']:
+        model_config = ModelConfig(**checkpoint['config']['model'])
+    else:
+        model_config = ModelConfig()
+    
+    model = create_model(
+        num_entities=data_module.num_entities,
+        num_rels=data_module.num_rels,
+        config=model_config,
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Get threshold
+    threshold = checkpoint.get('optimal_threshold', 0.5)
+    print(f"Using threshold: {threshold:.3f}")
+    
+    # Load global model if specified
+    global_model = None
     if args.use_global_model:
-        cmd.append('--use_global_model')
         if args.global_model_path:
-            cmd.extend(['--global_model_path', args.global_model_path])
+            global_model_path = Path(args.global_model_path)
+        else:
+            global_model_path = Path(f'./models/{args.dataset}/max_global.pth')
+        
+        if global_model_path.exists():
+            print(f"\nLoading global model from: {global_model_path}")
+            gm_checkpoint = torch.load(global_model_path, map_location=device)
+            gm_config = gm_checkpoint.get('config', {})
+            
+            global_model = create_global_model(
+                num_entities=data_module.num_entities,
+                num_rels=data_module.num_rels,
+                hidden_dim=gm_config.get('hidden_dim', 200),
+                num_bases=gm_config.get('num_bases', 5),
+                seq_len=gm_config.get('seq_len', 10),
+                pooling=gm_config.get('pooling', 'max'),
+            )
+            global_model.load_state_dict(gm_checkpoint['state_dict'])
+            global_model.global_emb = gm_checkpoint.get('global_emb', {})
+            print(f"  Global embeddings for {len(global_model.global_emb)} timesteps")
     
-    # Add prediction saving options
-    if getattr(args, 'save_predictions', False):
-        cmd.append('--save_predictions')
-        if args.predictions_dir:
-            cmd.extend(['--predictions_dir', args.predictions_dir])
-        if getattr(args, 'include_scores', False):
-            cmd.append('--include_scores')
-        if getattr(args, 'include_negative', False):
-            cmd.append('--include_negative')
+    # Create evaluator
+    evaluator = Evaluator(
+        model=model,
+        data_module=data_module,
+        device=device,
+        threshold=threshold,
+        global_model=global_model,
+    )
     
-    print(f"Command: {' '.join(cmd)}\n")
-    result = subprocess.run(cmd)
+    # Prepare predictions directory if saving predictions
+    predictions_dir = Path(args.predictions_dir) / args.dataset if args.save_predictions else None
     
-    return result.returncode == 0
+    # Run evaluation
+    if args.eval_mode == 'all':
+        if args.save_predictions:
+            results = evaluator.full_evaluation_with_predictions(
+                output_dir=predictions_dir,
+                include_scores=getattr(args, 'include_scores', False),
+            )
+        else:
+            results = evaluator.full_evaluation()
+    elif args.eval_mode == 'teacher_forcing':
+        metrics = evaluator.evaluate_teacher_forcing(collect_predictions=args.save_predictions)
+        results = {'teacher_forcing': metrics.to_dict()}
+        print(f"\n{metrics}")
+        if args.save_predictions:
+            evaluator.save_predictions(
+                predictions_dir / 'predictions_teacher_forcing.txt',
+                include_negative=getattr(args, 'include_negative', False),
+                include_scores=getattr(args, 'include_scores', False),
+            )
+    elif args.eval_mode == 'autoregressive':
+        metrics = evaluator.evaluate_autoregressive(collect_predictions=args.save_predictions)
+        results = {'autoregressive': metrics.to_dict()}
+        print(f"\n{metrics}")
+        if args.save_predictions:
+            evaluator.save_predictions(
+                predictions_dir / 'predictions_autoregressive.txt',
+                include_negative=getattr(args, 'include_negative', False),
+                include_scores=getattr(args, 'include_scores', False),
+            )
+    
+    return True
 
 
 def main():
@@ -328,6 +539,10 @@ def main():
         run_pretrain(args)
     
     elif args.command == 'train':
+        # Setup experiment name
+        if args.experiment_name is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            args.experiment_name = f"{args.dataset}_{timestamp}"
         run_train(args)
     
     elif args.command == 'evaluate':
