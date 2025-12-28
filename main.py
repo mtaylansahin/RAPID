@@ -31,9 +31,13 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-# Add project root to path for imports
-PROJECT_ROOT = Path(__file__).parent.absolute()
-sys.path.insert(0, str(PROJECT_ROOT))
+# Add project root and src/ to path for imports (Colab safety)
+PROJECT_ROOT = Path(__file__).parent.resolve()
+SRC_ROOT = PROJECT_ROOT / 'src'
+for p in (PROJECT_ROOT, SRC_ROOT):
+    p_str = str(p)
+    if p_str not in sys.path:
+        sys.path.insert(0, p_str)
 
 
 def get_base_args():

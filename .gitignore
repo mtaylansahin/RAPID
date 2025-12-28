@@ -43,7 +43,6 @@ uv.lock
 .ipynb_checkpoints/
 
 # Model checkpoints and outputs
-models/
 *.pth
 *.pt
 *.ckpt
