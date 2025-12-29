@@ -286,6 +286,88 @@ class PPIDataModule:
         
         return entity_history, entity_history_t
     
+    def _build_graph_dict_from_data(self, data: np.ndarray) -> Dict[int, dgl.DGLGraph]:
+        """Build DGL graphs for each timestep from given data array."""
+        graph_dict = {}
+        
+        # Group edges by timestep
+        edges_by_t: Dict[int, List[Tuple[int, int, int]]] = {}
+        for e1, rel, e2, t in data:
+            if t not in edges_by_t:
+                edges_by_t[t] = []
+            edges_by_t[t].append((e1, e2, rel))
+        
+        # Build graph for each timestep
+        for t, edges in edges_by_t.items():
+            edge_array = torch.LongTensor([[e[0], e[1]] for e in edges])
+            rel_array = torch.LongTensor([e[2] for e in edges])
+            
+            g = build_undirected_graph(
+                edges=edge_array,
+                rel_types=rel_array,
+                num_nodes=self.num_entities,
+                node_ids=torch.arange(self.num_entities),
+            )
+            
+            g.ids = {i: i for i in range(self.num_entities)}
+            graph_dict[t] = g
+        
+        return graph_dict
+    
+    def _build_histories_from_data(self, data: np.ndarray) -> Tuple[List[List[Dict]], List[List[int]]]:
+        """Build entity histories from given data array."""
+        entity_history: List[List[Dict]] = [[] for _ in range(self.num_entities)]
+        entity_history_t: List[List[int]] = [[] for _ in range(self.num_entities)]
+        
+        # Group edges by (entity, timestep)
+        edges_by_entity_t: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        
+        for e1, rel, e2, t in data:
+            key1 = (int(e1), int(t))
+            key2 = (int(e2), int(t))
+            
+            if key1 not in edges_by_entity_t:
+                edges_by_entity_t[key1] = []
+            edges_by_entity_t[key1].append((int(e2), int(rel)))
+            
+            if key2 not in edges_by_entity_t:
+                edges_by_entity_t[key2] = []
+            edges_by_entity_t[key2].append((int(e1), int(rel)))
+        
+        # Build history per entity (sorted by timestep)
+        for (entity, t), neighbors in sorted(edges_by_entity_t.items(), key=lambda x: x[0][1]):
+            entity_history[entity].append({
+                'neighbors': [n[0] for n in neighbors],
+                'rel_types': [n[1] for n in neighbors],
+            })
+            entity_history_t[entity].append(t)
+        
+        return entity_history, entity_history_t
+    
+    def get_train_val_context(self) -> Tuple[Dict[int, dgl.DGLGraph], List[List[Dict]], List[List[int]]]:
+        """
+        Get combined train + validation context for test evaluation.
+        
+        This provides the model with full historical context (train + val)
+        when evaluating on the test set, simulating a realistic scenario
+        where validation data would have been observed before test time.
+        
+        Returns:
+            Tuple of (graph_dict, entity_history, entity_history_t) covering
+            both training and validation timesteps.
+        """
+        # Combine train and validation data
+        combined_data = np.concatenate([
+            self.train_dataset.data,
+            self.val_dataset.data,
+        ], axis=0)
+        
+        # Build graph dict and histories from combined data
+        graph_dict = self._build_graph_dict_from_data(combined_data)
+        entity_history, entity_history_t = self._build_histories_from_data(combined_data)
+        
+        return graph_dict, entity_history, entity_history_t
+
     @property
     def train_data(self) -> np.ndarray:
         """Get training data as numpy array."""

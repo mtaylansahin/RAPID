@@ -507,6 +507,38 @@ class PPIGlobalModel(nn.Module):
             return self.predict(t, graph_dict)
         
         return None
+    
+    @torch.no_grad()
+    def extend_embeddings(
+        self,
+        new_graph_dict: Dict[int, dgl.DGLGraph],
+    ) -> Dict[int, torch.Tensor]:
+        """
+        Extend global embeddings to cover new timesteps.
+        
+        Computes global embeddings for timesteps in new_graph_dict that
+        are not already in self.global_emb. Useful for adding validation
+        timestep embeddings before test evaluation.
+        
+        Args:
+            new_graph_dict: Graph dict with additional timesteps
+        
+        Returns:
+            Updated global_emb dict
+        """
+        if self.global_emb is None:
+            self.global_emb = {}
+        
+        # Find new timesteps not already covered
+        existing_times = set(self.global_emb.keys())
+        all_times = sorted(new_graph_dict.keys())
+        
+        for t in all_times:
+            if t not in existing_times:
+                emb = self.predict(t, new_graph_dict)
+                self.global_emb[t] = emb.detach()
+        
+        return self.global_emb
 
 
 def create_global_model(

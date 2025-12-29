@@ -114,6 +114,9 @@ class RAPIDModel(nn.Module):
         # Global embeddings per timestep
         self._global_emb: Dict[int, torch.Tensor] = {}
         
+        # Reference to global model for on-the-fly embedding computation
+        self._global_model: Optional[nn.Module] = None
+        
         # Current timestep being processed
         self._latest_time: Optional[int] = None
         
@@ -176,6 +179,7 @@ class RAPIDModel(nn.Module):
         self._prediction_cache = defaultdict(set)
         self._graph_dict = {}
         self._global_emb = {}
+        self._global_model = None
         self._latest_time = None
     
     def init_from_train_history(
@@ -184,6 +188,7 @@ class RAPIDModel(nn.Module):
         entity_history: List[List[Dict]],
         entity_history_t: List[List[int]],
         global_emb: Optional[Dict[int, torch.Tensor]] = None,
+        global_model: Optional[nn.Module] = None,
     ) -> None:
         """
         Initialize inference state from training data.
@@ -192,12 +197,15 @@ class RAPIDModel(nn.Module):
             graph_dict: Pre-computed graphs per timestep
             entity_history: History per entity from training
             entity_history_t: Timestamps for history entries
-            global_emb: Global embeddings per timestep
+            global_emb: Global embeddings per timestep (precomputed)
+            global_model: Global model for on-the-fly embedding computation
+                          (used for timesteps not in global_emb)
         """
         self._graph_dict = graph_dict.copy()
         self._entity_history = [h.copy() for h in entity_history]
         self._entity_history_t = [t.copy() for t in entity_history_t]
         self._global_emb = global_emb.copy() if global_emb else {}
+        self._global_model = global_model
     
     def _get_entity_temporal_embed(
         self,
@@ -266,9 +274,15 @@ class RAPIDModel(nn.Module):
             else:
                 entity_rgcn_embed = self.entity_embeds[entity_id]
             
-            # Global embedding
+            # Global embedding - use precomputed or compute on-the-fly
             if t in self._global_emb:
                 global_embed = self._global_emb[t]
+            elif self._global_model is not None:
+                # Compute on-the-fly for new timesteps (e.g., during autoregressive eval)
+                with torch.no_grad():
+                    global_embed = self._global_model.predict(t, self._graph_dict)
+                    # Cache for future use
+                    self._global_emb[t] = global_embed.detach()
             else:
                 global_embed = torch.zeros(self.hidden_dim, device=device)
             

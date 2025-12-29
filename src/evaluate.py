@@ -174,6 +174,8 @@ class Evaluator:
         Evaluate autoregressively (predicted history).
         
         This simulates true inference where we don't know future interactions.
+        Uses train + validation data as historical context (since we would have
+        observed validation data before seeing test data in practice).
         
         Args:
             collect_predictions: If True, store predictions for later saving to file
@@ -183,20 +185,32 @@ class Evaluator:
         if collect_predictions:
             self.predictions = []
         
-        # Initialize model with training history
+        # Get combined train + validation context for realistic test evaluation
+        # This gives the model the full historical context it would have in practice
+        train_val_graph_dict, train_val_history, train_val_history_t = \
+            self.data_module.get_train_val_context()
+        
+        # Extend global embeddings to cover validation timesteps
+        if self.global_model is not None:
+            print("Extending global embeddings to validation timesteps...")
+            self.global_model.extend_embeddings(train_val_graph_dict)
+            self.global_emb = self.global_model.global_emb
+        
+        # Initialize model with train+val history and global model for on-the-fly embeddings
         self.model.reset_inference_state()
         self.model.init_from_train_history(
-            graph_dict=self.data_module.graph_dict,
-            entity_history=self.data_module.entity_history,
-            entity_history_t=self.data_module.entity_history_t,
+            graph_dict=train_val_graph_dict,
+            entity_history=train_val_history,
+            entity_history_t=train_val_history_t,
             global_emb=self.global_emb,
+            global_model=self.global_model,  # For on-the-fly global embedding computation
         )
         
         # Collect all predictions
         all_logits = []
         all_labels = []
         
-        print("\nEvaluating autoregressively...")
+        print("\nEvaluating autoregressively (with train+val context)...")
         
         # Get test data sorted by timestep
         self.data_module.test_dataset.neg_ratio = 1.0
