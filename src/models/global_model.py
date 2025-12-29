@@ -86,9 +86,11 @@ class GlobalRGCNAggregator(nn.Module):
         else:
             time_unit = times[1] - times[0]
         
-        # Filter to non-zero timesteps
-        num_non_zero = len(torch.nonzero(t_list))
-        t_list = t_list[:num_non_zero]
+        # Filter to valid timesteps (>= 0, since t=0 is a valid timestep)
+        # The batch may be padded with -1 or other invalid values at the end
+        valid_mask = t_list >= 0
+        num_valid = valid_mask.sum().item()
+        t_list = t_list[:num_valid]
         
         # Collect time sequences for each sample (times < t)
         time_list = []

@@ -111,13 +111,14 @@ class NegativeSampler:
         # Get temporal negatives (edges from t-1 that don't exist at t)
         temporal_candidates = self._prev_edges - self._current_edges
         temporal_negatives = self._sample_from_set(temporal_candidates, n_temporal)
+        temporal_negatives_set = set(temporal_negatives)
         
         # If not enough temporal negatives, fill with random
         if len(temporal_negatives) < n_temporal:
             n_random += n_temporal - len(temporal_negatives)
         
-        # Get random negatives
-        random_negatives = self._sample_random_negatives(n_random)
+        # Get random negatives (excluding temporal negatives to avoid duplicates)
+        random_negatives = self._sample_random_negatives(n_random, exclude=temporal_negatives_set)
         
         # Combine
         all_negatives = temporal_negatives + random_negatives
@@ -156,18 +157,28 @@ class NegativeSampler:
         indices = self.rng.choice(len(edges), size=n_samples, replace=False)
         return [edges[i] for i in indices]
     
-    def _sample_random_negatives(self, n_samples: int) -> List[Tuple[int, int]]:
-        """Sample random non-edges."""
+    def _sample_random_negatives(
+        self,
+        n_samples: int,
+        exclude: Optional[Set[Tuple[int, int]]] = None,
+    ) -> List[Tuple[int, int]]:
+        """Sample random non-edges.
+        
+        Args:
+            n_samples: Number of samples to generate
+            exclude: Optional set of edges to exclude (e.g., temporal negatives)
+        """
         if n_samples <= 0:
             return []
         
         all_pairs = self._get_all_pairs()
-        negatives = []
+        exclude = exclude or set()
         
-        # Filter out current positive edges
+        # Filter out current positive edges and excluded edges
         candidates = [
             (int(p[0]), int(p[1])) for p in all_pairs
             if (int(p[0]), int(p[1])) not in self._current_edges
+            and (int(p[0]), int(p[1])) not in exclude
         ]
         
         if len(candidates) == 0:

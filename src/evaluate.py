@@ -189,6 +189,7 @@ class Evaluator:
             graph_dict=self.data_module.graph_dict,
             entity_history=self.data_module.entity_history,
             entity_history_t=self.data_module.entity_history_t,
+            global_emb=self.global_emb,
         )
         
         # Collect all predictions
