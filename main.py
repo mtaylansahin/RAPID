@@ -322,8 +322,11 @@ def run_evaluate(args):
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Get threshold
-    threshold = checkpoint.get('optimal_threshold', 0.5)
+    # Get threshold (from args or checkpoint)
+    if hasattr(args, 'threshold') and args.threshold is not None:
+        threshold = args.threshold
+    else:
+        threshold = checkpoint.get('optimal_threshold', 0.5)
     print(f"Using threshold: {threshold:.3f}")
     
     # Load global model if specified
@@ -436,6 +439,8 @@ def main():
     )
     eval_parser.add_argument('--checkpoint', type=str, default=None,
                               help='Path to model checkpoint')
+    eval_parser.add_argument('--threshold', type=float, default=None,
+                              help='Classification threshold (default: use checkpoint value)')
     eval_parser.add_argument('--use_global_model', action='store_true',
                               help='Use pretrained global model')
     eval_parser.add_argument('--global_model_path', type=str, default=None,

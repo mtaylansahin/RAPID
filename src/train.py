@@ -165,28 +165,68 @@ class Trainer:
         self.model.eval()
         self.val_metrics.reset()
         
-        dataloader = self.data_module.get_val_dataloader()
+        # Collect all predictions
+        all_logits = []
+        all_labels = []
         
-        pbar = tqdm(dataloader, desc="Validation")
+        # Get validation timesteps
+        timesteps = sorted(self.data_module.val_dataset.unique_timesteps)
         
-        for batch in pbar:
-            entity1 = batch['entity1'].to(self.device)
-            entity2 = batch['entity2'].to(self.device)
-            labels = batch['labels'].to(self.device)
+        pbar = tqdm(timesteps, desc="Validation")
+        
+        for t in pbar:
+            # Get ALL pairs with ground truth labels
+            pairs, labels_np = self.data_module.get_all_pairs_for_timestep(t, split='valid')
             
-            logits = self.model(
-                entity1_ids=entity1,
-                entity2_ids=entity2,
-                entity1_history=batch['entity1_history'],
-                entity2_history=batch['entity2_history'],
-                entity1_history_t=batch['entity1_history_t'],
-                entity2_history_t=batch['entity2_history_t'],
-                graph_dict=self.data_module.graph_dict,
-                global_emb=self.global_emb,
-            )
-            
-            loss = self.criterion(logits, labels)
-            self.val_metrics.update(logits, labels, loss.item())
+            # Process in batches
+            batch_size = 128
+            for i in range(0, len(pairs), batch_size):
+                batch_pairs = pairs[i:i + batch_size]
+                batch_labels = labels_np[i:i + batch_size]
+                
+                entity1 = torch.LongTensor(batch_pairs[:, 0]).to(self.device)
+                entity2 = torch.LongTensor(batch_pairs[:, 1]).to(self.device)
+                labels = torch.FloatTensor(batch_labels).to(self.device)
+                
+                # Get entity histories for this timestep
+                entity1_history = []
+                entity1_history_t = []
+                entity2_history = []
+                entity2_history_t = []
+                
+                for j in range(len(batch_pairs)):
+                    e1, e2 = batch_pairs[j]
+                    # Get history up to (not including) current timestep
+                    e1_hist = [h for h, ht in zip(
+                        self.data_module.entity_history[e1],
+                        self.data_module.entity_history_t[e1]
+                    ) if ht < t]
+                    e1_hist_t = [ht for ht in self.data_module.entity_history_t[e1] if ht < t]
+                    
+                    e2_hist = [h for h, ht in zip(
+                        self.data_module.entity_history[e2],
+                        self.data_module.entity_history_t[e2]
+                    ) if ht < t]
+                    e2_hist_t = [ht for ht in self.data_module.entity_history_t[e2] if ht < t]
+                    
+                    entity1_history.append(e1_hist)
+                    entity1_history_t.append(e1_hist_t)
+                    entity2_history.append(e2_hist)
+                    entity2_history_t.append(e2_hist_t)
+                
+                logits = self.model(
+                    entity1_ids=entity1,
+                    entity2_ids=entity2,
+                    entity1_history=entity1_history,
+                    entity2_history=entity2_history,
+                    entity1_history_t=entity1_history_t,
+                    entity2_history_t=entity2_history_t,
+                    graph_dict=self.data_module.graph_dict,
+                    global_emb=self.global_emb,
+                )
+                
+                loss = self.criterion(logits, labels)
+                self.val_metrics.update(logits, labels, loss.item())
         
         # Compute metrics with optional threshold tuning
         metrics = self.val_metrics.compute(tune_threshold=tune_threshold)
