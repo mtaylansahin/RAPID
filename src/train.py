@@ -424,7 +424,7 @@ def main():
         data_path=data_config.dataset_path,
         batch_size=data_config.batch_size,
         neg_ratio=data_config.neg_ratio,
-        temporal_neg_ratio=data_config.temporal_neg_ratio,
+        hard_ratio=data_config.hard_ratio,
         seed=args.seed,
     )
     

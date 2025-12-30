@@ -26,7 +26,7 @@ class PPIDataset(Dataset):
         data_path: Path to dataset directory
         split: 'train', 'valid', or 'test'
         neg_ratio: Ratio of negative to positive samples
-        temporal_neg_ratio: Fraction of negatives that are temporal
+        hard_ratio: Fraction of negatives that should be hard (ever-positive but OFF)
         seed: Random seed
     """
     
@@ -35,13 +35,13 @@ class PPIDataset(Dataset):
         data_path: Path,
         split: str = 'train',
         neg_ratio: float = 1.0,
-        temporal_neg_ratio: float = 0.5,
+        hard_ratio: float = 0.5,
         seed: Optional[int] = None,
     ):
         self.data_path = Path(data_path)
         self.split = split
         self.neg_ratio = neg_ratio
-        self.temporal_neg_ratio = temporal_neg_ratio
+        self.hard_ratio = hard_ratio
         
         # Load dataset statistics
         self.num_entities, self.num_rels = self._load_stats()
@@ -58,7 +58,7 @@ class PPIDataset(Dataset):
         # Initialize negative sampler
         self.neg_sampler = NegativeSampler(
             num_entities=self.num_entities,
-            temporal_ratio=temporal_neg_ratio,
+            hard_ratio=hard_ratio,
             seed=seed,
         )
         
@@ -148,7 +148,7 @@ class PPIDataset(Dataset):
             pos_array = np.array(list(pos_edges))
             n_neg = int(len(pos_edges) * self.neg_ratio)
             
-            neg_e1, neg_e2, _ = self.neg_sampler.sample(
+            neg_e1, neg_e2 = self.neg_sampler.sample(
                 n_samples=n_neg,
                 timestep=t,
                 positive_edges=pos_array,
@@ -187,7 +187,7 @@ class PPIDataModule:
         data_path: Path to dataset
         batch_size: Batch size for dataloaders
         neg_ratio: Negative sampling ratio
-        temporal_neg_ratio: Temporal negative fraction
+        hard_ratio: Hard negative fraction
         seed: Random seed
     """
     
@@ -196,18 +196,18 @@ class PPIDataModule:
         data_path: Path,
         batch_size: int = 128,
         neg_ratio: float = 1.0,
-        temporal_neg_ratio: float = 0.5,
+        hard_ratio: float = 0.5,
         seed: Optional[int] = None,
     ):
         self.data_path = Path(data_path)
         self.batch_size = batch_size
         self.neg_ratio = neg_ratio
-        self.temporal_neg_ratio = temporal_neg_ratio
+        self.hard_ratio = hard_ratio
         self.seed = seed
         
         # Load datasets
         self.train_dataset = PPIDataset(
-            data_path, 'train', neg_ratio, temporal_neg_ratio, seed
+            data_path, 'train', neg_ratio, hard_ratio, seed
         )
         self.val_dataset = PPIDataset(
             data_path, 'valid', neg_ratio=0, seed=seed  # No negative sampling for val
@@ -392,9 +392,35 @@ class PPIDataModule:
             pin_memory=True,
         )
     
+    def get_all_pairs_for_timestep(self, timestep: int, split: str = 'test') -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get all entity pairs with labels for a given timestep.
+        
+        Used for unbiased evaluation on all possible pairs.
+        
+        Args:
+            timestep: The timestep to get pairs for
+            split: 'valid' or 'test' to determine ground truth source
+        
+        Returns:
+            Tuple of (pairs, labels) where pairs is (N, 2) and labels is (N,)
+        """
+        # Get ground truth edges for this timestep
+        dataset = self.val_dataset if split == 'valid' else self.test_dataset
+        edges_at_t = dataset.positives_by_timestep.get(timestep, set())
+        
+        pairs = []
+        labels = []
+        for i in range(self.num_entities):
+            for j in range(i + 1, self.num_entities):
+                pairs.append((i, j))
+                labels.append(1 if (i, j) in edges_at_t else 0)
+        
+        return np.array(pairs), np.array(labels)
+    
     def get_val_dataloader(self):
-        """Get validation dataloader."""
-        # For validation, we need negatives too
+        """Get validation dataloader (deprecated - use get_all_pairs_for_timestep for eval)."""
+        # Keep for backward compatibility, but prefer all-pairs evaluation
         self.val_dataset.neg_ratio = 1.0
         self.val_dataset.prepare_epoch()
         
@@ -408,7 +434,8 @@ class PPIDataModule:
         )
     
     def get_test_dataloader(self):
-        """Get test dataloader."""
+        """Get test dataloader (deprecated - use get_all_pairs_for_timestep for eval)."""
+        # Keep for backward compatibility, but prefer all-pairs evaluation
         self.test_dataset.neg_ratio = 1.0
         self.test_dataset.prepare_epoch()
         

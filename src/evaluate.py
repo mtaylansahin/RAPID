@@ -27,9 +27,8 @@ class Evaluator:
     """
     Evaluator for RAPID model.
     
-    Supports two modes:
-    1. Teacher forcing: Use ground-truth history (like training)
-    2. Autoregressive: Use predicted history (true inference)
+    Uses all-pairs evaluation for unbiased metrics.
+    Supports autoregressive inference with predicted history.
     
     Args:
         model: Trained RAPIDModel
@@ -74,12 +73,9 @@ class Evaluator:
         """
         Save predicted interactions to a text file.
         
-        Default format: subject object timestamp (3 columns)
-        Optionally includes prediction scores as 4th column.
-        
         Args:
             output_path: Path to save the predictions file
-            include_negative: If True, include negative predictions (non-interactions)
+            include_negative: If True, include negative predictions
             include_scores: If True, add prediction probability as 4th column
         """
         if not self.predictions:
@@ -91,7 +87,6 @@ class Evaluator:
         
         with open(output_path, 'w') as f:
             for e1, rel, e2, t, score, pred in self.predictions:
-                # Only save positive predictions unless include_negative is True
                 if pred == 1 or include_negative:
                     if include_scores:
                         f.write(f"{e1}\t{e2}\t{t}\t{score:.4f}\n")
@@ -106,136 +101,77 @@ class Evaluator:
             print(f"  Total predictions: {num_total}")
     
     @torch.no_grad()
-    def evaluate_teacher_forcing(self, collect_predictions: bool = False) -> ClassificationMetrics:
+    def evaluate(
+        self,
+        split: str = 'test',
+        collect_predictions: bool = False,
+    ) -> ClassificationMetrics:
         """
-        Evaluate with teacher forcing (ground-truth history).
+        Evaluate autoregressively on ALL pairs.
         
-        This is the standard evaluation matching training.
+        Uses train + validation data as historical context for test evaluation.
+        Evaluates on all N×N pairs for unbiased metrics.
         
         Args:
-            collect_predictions: If True, store predictions for later saving to file
-        """
-        self.model.eval()
-        metrics_computer = MetricsComputer(threshold=self.threshold)
-        
-        if collect_predictions:
-            self.predictions = []
-        
-        dataloader = self.data_module.get_test_dataloader()
-        
-        print("\nEvaluating with teacher forcing...")
-        pbar = tqdm(dataloader, desc="Test")
-        
-        for batch in pbar:
-            entity1 = batch['entity1'].to(self.device)
-            entity2 = batch['entity2'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            timesteps = batch['timesteps']
-            
-            logits = self.model(
-                entity1_ids=entity1,
-                entity2_ids=entity2,
-                entity1_history=batch['entity1_history'],
-                entity2_history=batch['entity2_history'],
-                entity1_history_t=batch['entity1_history_t'],
-                entity2_history_t=batch['entity2_history_t'],
-                graph_dict=self.data_module.graph_dict,
-                global_emb=self.global_emb,
-            )
-            
-            loss = self.criterion(logits, labels)
-            metrics_computer.update(logits, labels, loss.item())
-            
-            # Collect predictions if requested
-            if collect_predictions:
-                probs = torch.sigmoid(logits).cpu().numpy()
-                preds = (probs >= self.threshold).astype(int)
-                e1_np = entity1.cpu().numpy()
-                e2_np = entity2.cpu().numpy()
-                t_np = timesteps.numpy()
-                
-                for i in range(len(e1_np)):
-                    # Format: (subject, relation, object, timestamp, score, prediction)
-                    # Using relation=1 as default (interaction)
-                    self.predictions.append((
-                        int(e1_np[i]),
-                        1,  # relation (interaction)
-                        int(e2_np[i]),
-                        int(t_np[i]),
-                        float(probs[i]),
-                        int(preds[i])
-                    ))
-        
-        return metrics_computer.compute()
-    
-    @torch.no_grad()
-    def evaluate_autoregressive(self, collect_predictions: bool = False) -> ClassificationMetrics:
-        """
-        Evaluate autoregressively (predicted history).
-        
-        This simulates true inference where we don't know future interactions.
-        Uses train + validation data as historical context (since we would have
-        observed validation data before seeing test data in practice).
-        
-        Args:
-            collect_predictions: If True, store predictions for later saving to file
+            split: 'valid' or 'test'
+            collect_predictions: If True, store predictions for later saving
         """
         self.model.eval()
         
         if collect_predictions:
             self.predictions = []
         
-        # Get combined train + validation context for realistic test evaluation
-        # This gives the model the full historical context it would have in practice
-        train_val_graph_dict, train_val_history, train_val_history_t = \
-            self.data_module.get_train_val_context()
+        # Get dataset and timesteps
+        if split == 'valid':
+            dataset = self.data_module.val_dataset
+            # For validation, use train context only
+            context_graph_dict = self.data_module.graph_dict
+            context_history = self.data_module.entity_history
+            context_history_t = self.data_module.entity_history_t
+        else:
+            dataset = self.data_module.test_dataset
+            # For test, use train + val context
+            context_graph_dict, context_history, context_history_t = \
+                self.data_module.get_train_val_context()
         
-        # Extend global embeddings to cover validation timesteps
+        # Extend global embeddings if needed
         if self.global_model is not None:
-            print("Extending global embeddings to validation timesteps...")
-            self.global_model.extend_embeddings(train_val_graph_dict)
+            print("Extending global embeddings...")
+            self.global_model.extend_embeddings(context_graph_dict)
             self.global_emb = self.global_model.global_emb
         
-        # Initialize model with train+val history and global model for on-the-fly embeddings
+        # Initialize model with historical context
         self.model.reset_inference_state()
         self.model.init_from_train_history(
-            graph_dict=train_val_graph_dict,
-            entity_history=train_val_history,
-            entity_history_t=train_val_history_t,
+            graph_dict=context_graph_dict,
+            entity_history=context_history,
+            entity_history_t=context_history_t,
             global_emb=self.global_emb,
-            global_model=self.global_model,  # For on-the-fly global embedding computation
+            global_model=self.global_model,
         )
         
         # Collect all predictions
         all_logits = []
         all_labels = []
         
-        print("\nEvaluating autoregressively (with train+val context)...")
+        print(f"\nEvaluating on {split} set (all pairs)...")
         
-        # Get test data sorted by timestep
-        self.data_module.test_dataset.neg_ratio = 1.0
-        self.data_module.test_dataset.prepare_epoch()
+        # Get unique timesteps from dataset
+        timesteps = sorted(dataset.unique_timesteps)
         
-        # Group samples by timestep for proper autoregressive processing
-        samples_by_t: Dict[int, list] = {}
-        for sample in self.data_module.test_dataset.samples:
-            e1, e2, t, label = sample
-            if t not in samples_by_t:
-                samples_by_t[t] = []
-            samples_by_t[t].append((e1, e2, label))
-        
-        # Process timesteps in order
-        for t in tqdm(sorted(samples_by_t.keys()), desc="Timesteps"):
-            samples = samples_by_t[t]
+        for t in tqdm(timesteps, desc="Timesteps"):
+            # Get ALL pairs with ground truth labels
+            pairs, labels_np = self.data_module.get_all_pairs_for_timestep(t, split=split)
             
             # Process in batches
             batch_size = 128
-            for i in range(0, len(samples), batch_size):
-                batch = samples[i:i + batch_size]
+            for i in range(0, len(pairs), batch_size):
+                batch_pairs = pairs[i:i + batch_size]
+                batch_labels = labels_np[i:i + batch_size]
                 
-                entity1 = torch.LongTensor([s[0] for s in batch]).to(self.device)
-                entity2 = torch.LongTensor([s[1] for s in batch]).to(self.device)
-                labels = torch.FloatTensor([s[2] for s in batch]).to(self.device)
+                entity1 = torch.LongTensor(batch_pairs[:, 0]).to(self.device)
+                entity2 = torch.LongTensor(batch_pairs[:, 1]).to(self.device)
+                labels = torch.FloatTensor(batch_labels).to(self.device)
                 
                 # Get predictions (updates internal state)
                 probs, preds = self.model.predict_batch(
@@ -261,10 +197,9 @@ class Evaluator:
                     e2_np = entity2.cpu().numpy()
                     
                     for j in range(len(e1_np)):
-                        # Format: (subject, relation, object, timestamp, score, prediction)
                         self.predictions.append((
                             int(e1_np[j]),
-                            1,  # relation (interaction)
+                            1,  # relation
                             int(e2_np[j]),
                             int(t),
                             float(probs_np[j]),
@@ -275,13 +210,19 @@ class Evaluator:
         all_logits = torch.cat(all_logits)
         all_labels = torch.cat(all_labels)
         
+        # Report class balance
+        n_pos = all_labels.sum().item()
+        n_neg = len(all_labels) - n_pos
+        print(f"  Total pairs: {len(all_labels)} ({n_pos} positive, {n_neg} negative)")
+        print(f"  Class ratio: 1:{n_neg/max(n_pos, 1):.1f}")
+        
         metrics_computer = MetricsComputer(threshold=self.threshold)
         metrics_computer.update(all_logits, all_labels)
         
         return metrics_computer.compute()
     
     @torch.no_grad()
-    def evaluate_per_timestep(self) -> PerTimestepMetrics:
+    def evaluate_per_timestep(self, split: str = 'test') -> PerTimestepMetrics:
         """
         Evaluate and return metrics per timestep.
         
@@ -289,34 +230,62 @@ class Evaluator:
         """
         self.model.eval()
         
-        # Collect all predictions with timesteps
+        # Get dataset and context
+        if split == 'valid':
+            dataset = self.data_module.val_dataset
+            context_graph_dict = self.data_module.graph_dict
+            context_history = self.data_module.entity_history
+            context_history_t = self.data_module.entity_history_t
+        else:
+            dataset = self.data_module.test_dataset
+            context_graph_dict, context_history, context_history_t = \
+                self.data_module.get_train_val_context()
+        
+        # Initialize model
+        self.model.reset_inference_state()
+        self.model.init_from_train_history(
+            graph_dict=context_graph_dict,
+            entity_history=context_history,
+            entity_history_t=context_history_t,
+            global_emb=self.global_emb,
+            global_model=self.global_model,
+        )
+        
+        # Collect predictions with timesteps
         all_logits = []
         all_labels = []
         all_timesteps = []
         
-        dataloader = self.data_module.get_test_dataloader()
+        print(f"\nComputing per-timestep metrics ({split} set)...")
         
-        print("\nComputing per-timestep metrics...")
-        for batch in tqdm(dataloader):
-            entity1 = batch['entity1'].to(self.device)
-            entity2 = batch['entity2'].to(self.device)
-            labels = batch['labels']
-            timesteps = batch['timesteps']
+        timesteps = sorted(dataset.unique_timesteps)
+        
+        for t in tqdm(timesteps, desc="Timesteps"):
+            pairs, labels_np = self.data_module.get_all_pairs_for_timestep(t, split=split)
             
-            logits = self.model(
-                entity1_ids=entity1,
-                entity2_ids=entity2,
-                entity1_history=batch['entity1_history'],
-                entity2_history=batch['entity2_history'],
-                entity1_history_t=batch['entity1_history_t'],
-                entity2_history_t=batch['entity2_history_t'],
-                graph_dict=self.data_module.graph_dict,
-                global_emb=None,
-            )
-            
-            all_logits.append(logits.cpu())
-            all_labels.append(labels)
-            all_timesteps.append(timesteps)
+            batch_size = 128
+            for i in range(0, len(pairs), batch_size):
+                batch_pairs = pairs[i:i + batch_size]
+                batch_labels = labels_np[i:i + batch_size]
+                
+                entity1 = torch.LongTensor(batch_pairs[:, 0]).to(self.device)
+                entity2 = torch.LongTensor(batch_pairs[:, 1]).to(self.device)
+                labels = torch.FloatTensor(batch_labels)
+                
+                probs, _ = self.model.predict_batch(
+                    entity1_ids=entity1,
+                    entity2_ids=entity2,
+                    timestep=t,
+                    threshold=self.threshold,
+                    update_history=True,
+                )
+                
+                probs_clamped = probs.clamp(1e-7, 1 - 1e-7)
+                logits = torch.log(probs_clamped / (1 - probs_clamped))
+                
+                all_logits.append(logits.cpu())
+                all_labels.append(labels)
+                all_timesteps.append(torch.full((len(labels),), t))
         
         all_logits = torch.cat(all_logits)
         all_labels = torch.cat(all_labels)
@@ -327,93 +296,23 @@ class Evaluator:
             threshold=self.threshold,
         )
     
-    def full_evaluation(self) -> Dict[str, Any]:
+    def full_evaluation(self, split: str = 'test') -> Dict[str, Any]:
         """
-        Run full evaluation with all modes and analyses.
+        Run full evaluation with all analyses.
         
         Returns:
             Dictionary with all evaluation results
         """
         results = {}
         
-        # Teacher forcing evaluation
-        tf_metrics = self.evaluate_teacher_forcing()
-        results['teacher_forcing'] = tf_metrics.to_dict()
-        print(f"\nTeacher Forcing Results:")
-        print(f"  {tf_metrics}")
-        
-        # Autoregressive evaluation
-        ar_metrics = self.evaluate_autoregressive()
-        results['autoregressive'] = ar_metrics.to_dict()
-        print(f"\nAutoregressive Results:")
-        print(f"  {ar_metrics}")
-        
-        # Per-timestep analysis (teacher forcing)
-        per_ts_metrics = self.evaluate_per_timestep()
-        results['per_timestep'] = per_ts_metrics.to_dict()
-        print(f"\nPer-Timestep Analysis:")
-        print(f"  Mean AUPRC: {per_ts_metrics.mean_auprc:.4f}")
-        print(f"  Mean F1: {per_ts_metrics.mean_f1:.4f}")
-        
-        # Check for temporal degradation
-        if len(per_ts_metrics.auprcs) > 5:
-            early = np.mean(per_ts_metrics.auprcs[:5])
-            late = np.mean(per_ts_metrics.auprcs[-5:])
-            if late < early * 0.9:
-                print(f"  ⚠️ Temporal degradation detected: "
-                      f"early AUPRC {early:.4f} vs late {late:.4f}")
-        
-        return results
-    
-    def full_evaluation_with_predictions(
-        self,
-        output_dir: Optional[Path] = None,
-        include_scores: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Run full evaluation and save predictions to file.
-        
-        Args:
-            output_dir: Directory to save predictions (default: ./predictions/)
-            include_scores: If True, include prediction scores in output
-            
-        Returns:
-            Dictionary with all evaluation results
-        """
-        results = {}
-        
-        # Teacher forcing evaluation with predictions
-        tf_metrics = self.evaluate_teacher_forcing(collect_predictions=True)
-        results['teacher_forcing'] = tf_metrics.to_dict()
-        print(f"\nTeacher Forcing Results:")
-        print(f"  {tf_metrics}")
-        
-        # Save teacher forcing predictions
-        if output_dir is None:
-            output_dir = Path('./predictions')
-        output_dir = Path(output_dir)
-        
-        self.save_predictions(
-            output_dir / 'predictions_teacher_forcing.txt',
-            include_negative=False,
-            include_scores=include_scores,
-        )
-        
-        # Autoregressive evaluation with predictions
-        ar_metrics = self.evaluate_autoregressive(collect_predictions=True)
-        results['autoregressive'] = ar_metrics.to_dict()
-        print(f"\nAutoregressive Results:")
-        print(f"  {ar_metrics}")
-        
-        # Save autoregressive predictions
-        self.save_predictions(
-            output_dir / 'predictions_autoregressive.txt',
-            include_negative=False,
-            include_scores=include_scores,
-        )
+        # Main evaluation
+        metrics = self.evaluate(split=split)
+        results['metrics'] = metrics.to_dict()
+        print(f"\n{split.capitalize()} Results:")
+        print(f"  {metrics}")
         
         # Per-timestep analysis
-        per_ts_metrics = self.evaluate_per_timestep()
+        per_ts_metrics = self.evaluate_per_timestep(split=split)
         results['per_timestep'] = per_ts_metrics.to_dict()
         print(f"\nPer-Timestep Analysis:")
         print(f"  Mean AUPRC: {per_ts_metrics.mean_auprc:.4f}")
@@ -481,11 +380,9 @@ def main():
                         help='Use pretrained global model')
     parser.add_argument('--global_model_path', type=str, default=None,
                         help='Path to global model checkpoint')
-    
-    # Evaluation mode
-    parser.add_argument('--mode', type=str, default='all',
-                        choices=['all', 'teacher_forcing', 'autoregressive', 'per_timestep'],
-                        help='Evaluation mode')
+    parser.add_argument('--split', type=str, default='test',
+                        choices=['valid', 'test'],
+                        help='Data split to evaluate')
     
     # Prediction output options
     parser.add_argument('--save_predictions', action='store_true',
@@ -511,7 +408,7 @@ def main():
     data_module = PPIDataModule(
         data_path=Path(args.data_dir) / args.dataset,
         batch_size=args.batch_size,
-        neg_ratio=1.0,  # Always use 1:1 for evaluation
+        neg_ratio=1.0,
     )
     
     # Load model
@@ -565,37 +462,14 @@ def main():
     predictions_dir = Path(args.predictions_dir) / args.dataset if args.save_predictions else None
     
     # Run evaluation
-    if args.mode == 'all':
-        if args.save_predictions:
-            results = evaluator.full_evaluation_with_predictions(
-                output_dir=predictions_dir,
-                include_scores=args.include_scores,
-            )
-        else:
-            results = evaluator.full_evaluation()
-    elif args.mode == 'teacher_forcing':
-        metrics = evaluator.evaluate_teacher_forcing(collect_predictions=args.save_predictions)
-        results = {'teacher_forcing': metrics.to_dict()}
-        print(f"\n{metrics}")
-        if args.save_predictions:
-            evaluator.save_predictions(
-                predictions_dir / 'predictions_teacher_forcing.txt',
-                include_negative=args.include_negative,
-                include_scores=args.include_scores,
-            )
-    elif args.mode == 'autoregressive':
-        metrics = evaluator.evaluate_autoregressive(collect_predictions=args.save_predictions)
-        results = {'autoregressive': metrics.to_dict()}
-        print(f"\n{metrics}")
-        if args.save_predictions:
-            evaluator.save_predictions(
-                predictions_dir / 'predictions_autoregressive.txt',
-                include_negative=args.include_negative,
-                include_scores=args.include_scores,
-            )
-    elif args.mode == 'per_timestep':
-        per_ts = evaluator.evaluate_per_timestep()
-        results = {'per_timestep': per_ts.to_dict()}
+    results = evaluator.full_evaluation(split=args.split)
+    if args.save_predictions:
+        evaluator.evaluate(split=args.split, collect_predictions=True)
+        evaluator.save_predictions(
+            predictions_dir / f'predictions_{args.split}.txt',
+            include_negative=args.include_negative,
+            include_scores=args.include_scores,
+        )
     
     # Save results
     if args.output:

@@ -193,7 +193,7 @@ def run_train(args):
         data_path=data_config.dataset_path,
         batch_size=data_config.batch_size,
         neg_ratio=data_config.neg_ratio,
-        temporal_neg_ratio=data_config.temporal_neg_ratio,
+        hard_ratio=data_config.hard_ratio,
         seed=args.seed,
     )
     
@@ -364,34 +364,14 @@ def run_evaluate(args):
     predictions_dir = Path(args.predictions_dir) / args.dataset if args.save_predictions else None
     
     # Run evaluation
-    if args.eval_mode == 'all':
-        if args.save_predictions:
-            results = evaluator.full_evaluation_with_predictions(
-                output_dir=predictions_dir,
-                include_scores=getattr(args, 'include_scores', False),
-            )
-        else:
-            results = evaluator.full_evaluation()
-    elif args.eval_mode == 'teacher_forcing':
-        metrics = evaluator.evaluate_teacher_forcing(collect_predictions=args.save_predictions)
-        results = {'teacher_forcing': metrics.to_dict()}
-        print(f"\n{metrics}")
-        if args.save_predictions:
-            evaluator.save_predictions(
-                predictions_dir / 'predictions_teacher_forcing.txt',
-                include_negative=getattr(args, 'include_negative', False),
-                include_scores=getattr(args, 'include_scores', False),
-            )
-    elif args.eval_mode == 'autoregressive':
-        metrics = evaluator.evaluate_autoregressive(collect_predictions=args.save_predictions)
-        results = {'autoregressive': metrics.to_dict()}
-        print(f"\n{metrics}")
-        if args.save_predictions:
-            evaluator.save_predictions(
-                predictions_dir / 'predictions_autoregressive.txt',
-                include_negative=getattr(args, 'include_negative', False),
-                include_scores=getattr(args, 'include_scores', False),
-            )
+    results = evaluator.full_evaluation()
+    if args.save_predictions:
+        evaluator.evaluate(collect_predictions=True)
+        evaluator.save_predictions(
+            predictions_dir / 'predictions.txt',
+            include_negative=getattr(args, 'include_negative', False),
+            include_scores=getattr(args, 'include_scores', False),
+        )
     
     return True
 
@@ -456,9 +436,6 @@ def main():
     )
     eval_parser.add_argument('--checkpoint', type=str, default=None,
                               help='Path to model checkpoint')
-    eval_parser.add_argument('--eval_mode', type=str, default='all',
-                              choices=['teacher_forcing', 'autoregressive', 'all'],
-                              help='Evaluation mode')
     eval_parser.add_argument('--use_global_model', action='store_true',
                               help='Use pretrained global model')
     eval_parser.add_argument('--global_model_path', type=str, default=None,
@@ -506,10 +483,6 @@ def main():
                              help='Path to global model checkpoint')
     all_parser.add_argument('--experiment_name', type=str, default=None,
                              help='Experiment name for checkpoints')
-    # Eval args
-    all_parser.add_argument('--eval_mode', type=str, default='all',
-                             choices=['teacher_forcing', 'autoregressive', 'all'],
-                             help='Evaluation mode')
     all_parser.add_argument('--checkpoint', type=str, default=None,
                              help='Path to model checkpoint (for evaluate only)')
     # Prediction output options

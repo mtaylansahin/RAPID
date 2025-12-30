@@ -14,7 +14,7 @@ class DataConfig:
     
     # Negative sampling
     neg_ratio: float = 1.0  # Ratio of negative to positive samples
-    temporal_neg_ratio: float = 0.5  # Fraction of negatives that are temporal
+    hard_ratio: float = 0.5  # Fraction of negatives that should be hard (ever-positive but OFF)
     
     # Batch settings
     batch_size: int = 128
