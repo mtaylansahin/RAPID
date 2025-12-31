@@ -100,26 +100,30 @@ class Evaluator:
         if include_negative:
             print(f"  Total predictions: {num_total}")
     
-    @torch.no_grad()
-    def evaluate(
+    def run_inference(
         self,
         split: str = 'test',
-        collect_predictions: bool = False,
-    ) -> ClassificationMetrics:
+        force_rerun: bool = False,
+    ) -> Dict[str, Any]:
         """
-        Evaluate autoregressively on ALL pairs.
-        
-        Uses train + validation data as historical context for test evaluation.
-        Evaluates on all N×N pairs for unbiased metrics.
+        Run autoregressive inference loop and cache results.
         
         Args:
             split: 'valid' or 'test'
-            collect_predictions: If True, store predictions for later saving
+            force_rerun: If True, ignore cache and rerun
+            
+        Returns:
+            Dictionary containing:
+            - logits: torch.Tensor
+            - labels: torch.Tensor
+            - timesteps: torch.Tensor
+            - predictions: List of tuples (e1, rel, e2, t, score, pred)
         """
+        # Return cached results if available
+        if not force_rerun and hasattr(self, '_cached_results') and self._cached_results.get('split') == split:
+            return self._cached_results
+            
         self.model.eval()
-        
-        if collect_predictions:
-            self.predictions = []
         
         # Get dataset and timesteps
         if split == 'valid':
@@ -153,14 +157,16 @@ class Evaluator:
         # Collect all predictions
         all_logits = []
         all_labels = []
+        all_timesteps = []
+        detailed_predictions = []
         
-        print(f"\nEvaluating on {split} set (all pairs)...")
+        print(f"\nRunning inference on {split} set...")
         
         # Get unique timesteps from dataset
         timesteps = sorted(dataset.unique_timesteps)
         
         for t in tqdm(timesteps, desc="Timesteps"):
-            # Get ALL pairs with ground truth labels
+            # Get known history pairs
             pairs, labels_np = self.data_module.get_history_pairs_for_timestep(t, split=split)
             
             # Process in batches
@@ -188,111 +194,78 @@ class Evaluator:
                 
                 all_logits.append(logits.cpu())
                 all_labels.append(labels.cpu())
+                all_timesteps.append(torch.full((len(labels),), t))
                 
-                # Collect predictions if requested
-                if collect_predictions:
-                    probs_np = probs.cpu().numpy()
-                    preds_np = preds.cpu().numpy()
-                    e1_np = entity1.cpu().numpy()
-                    e2_np = entity2.cpu().numpy()
-                    
-                    for j in range(len(e1_np)):
-                        self.predictions.append((
-                            int(e1_np[j]),
-                            1,  # relation
-                            int(e2_np[j]),
-                            int(t),
-                            float(probs_np[j]),
-                            int(preds_np[j])
-                        ))
+                # Store detailed predictions
+                probs_np = probs.cpu().numpy()
+                preds_np = preds.cpu().numpy()
+                e1_np = entity1.cpu().numpy()
+                e2_np = entity2.cpu().numpy()
+                
+                for j in range(len(e1_np)):
+                    detailed_predictions.append((
+                        int(e1_np[j]),
+                        1,  # relation (assumed 1 for now or from graph)
+                        int(e2_np[j]),
+                        int(t),
+                        float(probs_np[j]),
+                        int(preds_np[j])
+                    ))
         
-        # Compute metrics
-        all_logits = torch.cat(all_logits)
-        all_labels = torch.cat(all_labels)
+        # Concatenate results
+        results = {
+            'split': split,
+            'logits': torch.cat(all_logits),
+            'labels': torch.cat(all_labels),
+            'timesteps': torch.cat(all_timesteps),
+            'predictions': detailed_predictions
+        }
+        
+        # Cache results
+        self._cached_results = results
+        return results
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        split: str = 'test',
+        collect_predictions: bool = False,
+    ) -> ClassificationMetrics:
+        """
+        Compute classification metrics.
+        
+        Uses cached inference results if available.
+        """
+        results = self.run_inference(split=split)
+        
+        logits = results['logits']
+        labels = results['labels']
+        self.predictions = results['predictions'] if collect_predictions else []
         
         # Report class balance
-        n_pos = all_labels.sum().item()
-        n_neg = len(all_labels) - n_pos
-        print(f"  Total pairs: {len(all_labels)} ({n_pos} positive, {n_neg} negative)")
+        n_pos = labels.sum().item()
+        n_neg = len(labels) - n_pos
+        print(f"  Total pairs: {len(labels)} ({n_pos} positive, {n_neg} negative)")
         print(f"  Class ratio: 1:{n_neg/max(n_pos, 1):.1f}")
         
         metrics_computer = MetricsComputer(threshold=self.threshold)
-        metrics_computer.update(all_logits, all_labels)
+        metrics_computer.update(logits, labels)
         
         return metrics_computer.compute()
     
     @torch.no_grad()
     def evaluate_per_timestep(self, split: str = 'test') -> PerTimestepMetrics:
         """
-        Evaluate and return metrics per timestep.
+        Compute metrics per timestep.
         
-        Useful for analyzing temporal degradation.
+        Uses cached inference results if available.
         """
-        self.model.eval()
-        
-        # Get dataset and context
-        if split == 'valid':
-            dataset = self.data_module.val_dataset
-            context_graph_dict = self.data_module.graph_dict
-            context_history = self.data_module.entity_history
-            context_history_t = self.data_module.entity_history_t
-        else:
-            dataset = self.data_module.test_dataset
-            context_graph_dict, context_history, context_history_t = \
-                self.data_module.get_train_val_context()
-        
-        # Initialize model
-        self.model.reset_inference_state()
-        self.model.init_from_train_history(
-            graph_dict=context_graph_dict,
-            entity_history=context_history,
-            entity_history_t=context_history_t,
-            global_emb=self.global_emb,
-            global_model=self.global_model,
-        )
-        
-        # Collect predictions with timesteps
-        all_logits = []
-        all_labels = []
-        all_timesteps = []
-        
-        print(f"\nComputing per-timestep metrics ({split} set)...")
-        
-        timesteps = sorted(dataset.unique_timesteps)
-        
-        for t in tqdm(timesteps, desc="Timesteps"):
-            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(t, split=split)
-            
-            batch_size = 128
-            for i in range(0, len(pairs), batch_size):
-                batch_pairs = pairs[i:i + batch_size]
-                batch_labels = labels_np[i:i + batch_size]
-                
-                entity1 = torch.LongTensor(batch_pairs[:, 0]).to(self.device)
-                entity2 = torch.LongTensor(batch_pairs[:, 1]).to(self.device)
-                labels = torch.FloatTensor(batch_labels)
-                
-                probs, _ = self.model.predict_batch(
-                    entity1_ids=entity1,
-                    entity2_ids=entity2,
-                    timestep=t,
-                    threshold=self.threshold,
-                    update_history=True,
-                )
-                
-                probs_clamped = probs.clamp(1e-7, 1 - 1e-7)
-                logits = torch.log(probs_clamped / (1 - probs_clamped))
-                
-                all_logits.append(logits.cpu())
-                all_labels.append(labels)
-                all_timesteps.append(torch.full((len(labels),), t))
-        
-        all_logits = torch.cat(all_logits)
-        all_labels = torch.cat(all_labels)
-        all_timesteps = torch.cat(all_timesteps)
+        results = self.run_inference(split=split)
         
         return compute_per_timestep_metrics(
-            all_logits, all_labels, all_timesteps,
+            results['logits'],
+            results['labels'],
+            results['timesteps'],
             threshold=self.threshold,
         )
     
@@ -300,18 +273,20 @@ class Evaluator:
         """
         Run full evaluation with all analyses.
         
-        Returns:
-            Dictionary with all evaluation results
+        Runs inference ONCE and computes both overall and per-timestep metrics.
         """
+        # Force a fresh run for full evaluation
+        self.run_inference(split=split, force_rerun=True)
+        
         results = {}
         
-        # Main evaluation
-        metrics = self.evaluate(split=split)
+        # Main evaluation (uses cache)
+        metrics = self.evaluate(split=split, collect_predictions=True)
         results['metrics'] = metrics.to_dict()
         print(f"\n{split.capitalize()} Results:")
         print(f"  {metrics}")
         
-        # Per-timestep analysis
+        # Per-timestep analysis (uses cache)
         per_ts_metrics = self.evaluate_per_timestep(split=split)
         results['per_timestep'] = per_ts_metrics.to_dict()
         print(f"\nPer-Timestep Analysis:")

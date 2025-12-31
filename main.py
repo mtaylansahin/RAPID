@@ -370,7 +370,6 @@ def run_evaluate(args):
     # Run evaluation
     results = evaluator.full_evaluation()
     if args.save_predictions:
-        evaluator.evaluate(collect_predictions=True)
         evaluator.save_predictions(
             predictions_dir / 'predictions.txt',
             include_negative=getattr(args, 'include_negative', False),
