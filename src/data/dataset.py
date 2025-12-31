@@ -392,11 +392,13 @@ class PPIDataModule:
             pin_memory=True,
         )
     
-    def get_all_pairs_for_timestep(self, timestep: int, split: str = 'test') -> Tuple[np.ndarray, np.ndarray]:
+    def get_history_pairs_for_timestep(self, timestep: int, split: str = 'test') -> Tuple[np.ndarray, np.ndarray]:
         """
-        Get all entity pairs with labels for a given timestep.
+        Get all known history pairs with labels for a given timestep.
         
-        Used for unbiased evaluation on all possible pairs.
+        Evaluates ONLY on pairs that have ever interacted in the dataset (History Constrained).
+        This focuses the evaluation on the 'dynamics' prediction task rather than
+        global link discovery.
         
         Args:
             timestep: The timestep to get pairs for
@@ -409,44 +411,25 @@ class PPIDataModule:
         dataset = self.val_dataset if split == 'valid' else self.test_dataset
         edges_at_t = dataset.positives_by_timestep.get(timestep, set())
         
+        # Build candidate pairs from known history
         pairs = []
         labels = []
-        for i in range(self.num_entities):
-            for j in range(i + 1, self.num_entities):
-                pairs.append((i, j))
-                labels.append(1 if (i, j) in edges_at_t else 0)
+        
+        # Use known_pairs if available, otherwise build it lazily
+        if not hasattr(self, 'known_pairs'):
+            self.known_pairs = set()
+            for ds in [self.train_dataset, self.val_dataset, self.test_dataset]:
+                for e1, rel, e2, t in ds.data:
+                    self.known_pairs.add(tuple(sorted((int(e1), int(e2)))))
+            # Sort for deterministic order
+            self.known_pairs_list = sorted(list(self.known_pairs))
+        
+        # Evaluate on all known pairs
+        for e1, e2 in self.known_pairs_list:
+            pairs.append((e1, e2))
+            labels.append(1 if (e1, e2) in edges_at_t else 0)
         
         return np.array(pairs), np.array(labels)
-    
-    def get_val_dataloader(self):
-        """Get validation dataloader (deprecated - use get_all_pairs_for_timestep for eval)."""
-        # Keep for backward compatibility, but prefer all-pairs evaluation
-        self.val_dataset.neg_ratio = 1.0
-        self.val_dataset.prepare_epoch()
-        
-        return torch.utils.data.DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=self._collate_fn,
-            num_workers=0,
-            pin_memory=True,
-        )
-    
-    def get_test_dataloader(self):
-        """Get test dataloader (deprecated - use get_all_pairs_for_timestep for eval)."""
-        # Keep for backward compatibility, but prefer all-pairs evaluation
-        self.test_dataset.neg_ratio = 1.0
-        self.test_dataset.prepare_epoch()
-        
-        return torch.utils.data.DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=self._collate_fn,
-            num_workers=0,
-            pin_memory=True,
-        )
     
     def _collate_fn(self, batch: List[Dict]) -> Dict:
         """Collate batch of samples."""

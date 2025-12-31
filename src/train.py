@@ -176,7 +176,7 @@ class Trainer:
         
         for t in pbar:
             # Get ALL pairs with ground truth labels
-            pairs, labels_np = self.data_module.get_all_pairs_for_timestep(t, split='valid')
+            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(t, split='valid')
             
             # Process in batches
             batch_size = 128

@@ -157,6 +157,7 @@ def run_train(args):
         dataset=args.dataset,
         data_dir=Path('./data'),
         neg_ratio=args.neg_ratio,
+        hard_ratio=args.hard_ratio,
         batch_size=args.batch_size,
     )
     
@@ -420,6 +421,8 @@ def main():
                                help='Batch size')
     train_parser.add_argument('--neg_ratio', type=float, default=1.0,
                                help='Negative sampling ratio')
+    train_parser.add_argument('--hard_ratio', type=float, default=0.5,
+                               help='Hard negative ratio (history constrained)')
     train_parser.add_argument('--focal_gamma', type=float, default=2.0,
                                help='Focal loss gamma')
     train_parser.add_argument('--patience', type=int, default=10,
@@ -478,6 +481,8 @@ def main():
                              help='Batch size')
     all_parser.add_argument('--neg_ratio', type=float, default=1.0,
                              help='Negative sampling ratio')
+    all_parser.add_argument('--hard_ratio', type=float, default=0.5,
+                             help='Hard negative ratio (history constrained)')
     all_parser.add_argument('--focal_gamma', type=float, default=2.0,
                              help='Focal loss gamma')
     all_parser.add_argument('--patience', type=int, default=10,

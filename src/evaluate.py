@@ -161,7 +161,7 @@ class Evaluator:
         
         for t in tqdm(timesteps, desc="Timesteps"):
             # Get ALL pairs with ground truth labels
-            pairs, labels_np = self.data_module.get_all_pairs_for_timestep(t, split=split)
+            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(t, split=split)
             
             # Process in batches
             batch_size = 128
@@ -261,7 +261,7 @@ class Evaluator:
         timesteps = sorted(dataset.unique_timesteps)
         
         for t in tqdm(timesteps, desc="Timesteps"):
-            pairs, labels_np = self.data_module.get_all_pairs_for_timestep(t, split=split)
+            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(t, split=split)
             
             batch_size = 128
             for i in range(0, len(pairs), batch_size):
