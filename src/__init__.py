@@ -1,6 +1,6 @@
 # RAPID: A Recurrent Architecture for Predicting Protein Interaction Dynamics
 """
-RAPID adapts the RE-Net architecture for binary classification of 
+RAPID adapts the RE-Net architecture for binary classification of
 protein-protein interaction dynamics from molecular dynamics simulations.
 
 Key differences from original RE-Net:
