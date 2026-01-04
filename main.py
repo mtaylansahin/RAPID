@@ -38,6 +38,7 @@ import torch.nn as nn
 # Internal imports
 from src.config import ModelConfig, TrainingConfig
 from src.data.dataset import PPIDataModule
+from src.data.preprocessing import PreprocessingConfig, run_preprocessing
 from src.evaluate import Evaluator
 from src.models.global_model import create_global_model
 from src.models.rapid import create_model
@@ -464,8 +465,27 @@ def main():
     # === All command (full pipeline) ===
     all_parser = subparsers.add_parser(
         "all",
-        help="Run full pipeline: pretrain -> train -> evaluate",
+        help="Run full pipeline: preprocess -> pretrain (optional) -> train -> evaluate",
         parents=[get_base_args()],
+    )
+    # Preprocess args
+    all_parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="Raw data directory with .interfacea files (optional, skip if data preprocessed)",
+    )
+    all_parser.add_argument(
+        "--replica",
+        type=str,
+        default=None,
+        help="Replica name for preprocessing (e.g., replica1)",
+    )
+    all_parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.2,
+        help="Test/validation ratio for preprocessing (default: 0.2)",
     )
     # Pretrain args
     all_parser.add_argument(
@@ -543,6 +563,36 @@ def main():
         help="Directory to save prediction files",
     )
 
+    # === Preprocess command ===
+    preprocess_parser = subparsers.add_parser(
+        "preprocess",
+        help="Preprocess raw MD simulation data into RAPID format",
+    )
+    preprocess_parser.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="Directory containing replica folders with .interfacea files",
+    )
+    preprocess_parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Output directory for processed data files",
+    )
+    preprocess_parser.add_argument(
+        "--replica",
+        type=str,
+        required=True,
+        help="Replica name (e.g., replica1)",
+    )
+    preprocess_parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of timeline for test set; validation uses same ratio (default: 0.2)",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -553,9 +603,10 @@ def main():
     print("RAPID: Recurrent Architecture for Predicting Protein Interaction Dynamics")
     print("=" * 60)
     print(f"Command: {args.command}")
-    print(f"Dataset: {args.dataset}")
-    print(f"GPU: {args.gpu}")
-    print(f"Seed: {args.seed}")
+    if args.command != "preprocess":
+        print(f"Dataset: {args.dataset}")
+        print(f"GPU: {args.gpu}")
+        print(f"Seed: {args.seed}")
 
     # Execute command
     if args.command == "pretrain":
@@ -571,11 +622,47 @@ def main():
     elif args.command == "evaluate":
         run_evaluate(args)
 
+    elif args.command == "preprocess":
+        config = PreprocessingConfig(
+            data_directory=Path(args.data_dir),
+            output_directory=Path(args.output_dir),
+            replica=args.replica,
+            test_ratio=args.test_ratio,
+        )
+
+        result = run_preprocessing(config)
+
+        if result.success:
+            print("\n✓ Preprocessing complete!")
+            print(f"  Entities:    {result.num_entities}")
+            print(f"  Relations:   {result.num_relations}")
+            print(f"  Timesteps:   {result.num_timesteps}")
+            print(f"  Train:       {result.train_samples} samples")
+            print(f"  Valid:       {result.valid_samples} samples")
+            print(f"  Test:        {result.test_samples} samples")
+            print(f"  Output:      {result.output_directory}")
+        else:
+            print(f"\n✗ Preprocessing failed: {result.error_message}")
+            sys.exit(1)
+
     elif args.command == "all":
-        # Run full pipeline
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if not args.experiment_name:
             args.experiment_name = f"{args.dataset}_{timestamp}"
+
+        # Step 0: Preprocess (if raw data provided)
+        if hasattr(args, "data_dir") and args.data_dir:
+            preprocess_config = PreprocessingConfig(
+                data_directory=Path(args.data_dir),
+                output_directory=DATA_DIR / args.dataset,
+                replica=args.replica,
+                test_ratio=args.test_ratio if hasattr(args, "test_ratio") else 0.2,
+            )
+            result = run_preprocessing(preprocess_config)
+            if not result.success:
+                print(f"\n✗ Preprocessing failed: {result.error_message}")
+                sys.exit(1)
+            print("\n✓ Preprocessing complete!")
 
         # Step 1: Pretrain (if using global model)
         if args.use_global_model:
