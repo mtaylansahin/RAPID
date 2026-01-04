@@ -312,8 +312,6 @@ class Trainer:
                 "model": {
                     "hidden_dim": self.model.hidden_dim,
                     "seq_len": self.model.seq_len,
-                    "num_entities": self.model.num_entities,
-                    "num_rels": self.model.num_rels,
                 },
             },
             "metrics": metrics.to_dict(),
