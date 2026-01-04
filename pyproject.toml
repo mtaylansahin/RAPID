@@ -12,6 +12,8 @@ dependencies = [
     "packaging",
     "setuptools",
     "pandas>=2.3.3",
+    "matplotlib",
+    "seaborn",
 ]
 
 [project.optional-dependencies]

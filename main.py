@@ -40,6 +40,7 @@ from src.config import ModelConfig, TrainingConfig
 from src.data.dataset import PPIDataModule
 from src.data.preprocessing import PreprocessingConfig, run_preprocessing
 from src.evaluate import Evaluator
+from src.analysis import AnalysisConfig, ResultsManager
 from src.models.global_model import create_global_model
 from src.models.rapid import create_model
 from src.pretrain import train_global_model
@@ -344,13 +345,30 @@ def run_evaluate(args) -> bool:
         global_model=global_model,
     )
 
-    # Prepare predictions directory if saving predictions
-    predictions_dir = PREDICTIONS_DIR / args.dataset if args.save_predictions else None
+    # Prepare predictions directory for analysis + optional saving
+    predictions_dir = Path(args.predictions_dir) / args.dataset
+    predictions_path = predictions_dir / "predictions.txt"
 
     # Run evaluation
     evaluator.full_evaluation()
-    if args.save_predictions:
-        evaluator.save_predictions(predictions_dir / "predictions.txt")
+    evaluator.save_predictions(predictions_path)
+
+    if not args.save_predictions:
+        print("Note: Predictions saved for analysis despite --no_save_predictions.")
+
+    # Run analysis + visualization outputs
+    analysis_output_dir = Path("analysis_outputs") / Path(checkpoint_path).parent.name
+    analysis_config = AnalysisConfig(
+        input_directory=str(data_path),
+        output_directory=str(analysis_output_dir),
+        output_file_path=str(predictions_path),
+    )
+    results_manager = ResultsManager(analysis_config)
+    analysis_success = results_manager.run_complete_analysis()
+    if analysis_success:
+        print(f"\nAnalysis outputs saved to: {analysis_output_dir}")
+    else:
+        print("\nWarning: Analysis pipeline failed. Check logs for details.")
 
     return True
 
