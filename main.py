@@ -51,6 +51,7 @@ MODELS_DIR = Path("./models")
 CHECKPOINTS_DIR = Path("./checkpoints")
 LOGS_DIR = Path("./logs")
 PREDICTIONS_DIR = Path("./predictions")
+ANALYSIS_DIR = Path("./analysis")
 
 
 def get_base_args():
@@ -264,7 +265,7 @@ def run_train(args) -> Path:
 
 
 def run_evaluate(args) -> bool:
-    """Run evaluation."""
+    """Run evaluation with analysis and visualization."""
     print("\n" + "=" * 60)
     print("Stage 3: Evaluation")
     print("=" * 60)
@@ -331,7 +332,7 @@ def run_evaluate(args) -> bool:
             num_entities=data_module.num_entities,
             num_rels=data_module.num_rels,
             device=device,
-            default_hidden_dim=200,  # Default for evaluation if config missing
+            default_hidden_dim=200,
             default_seq_len=10,
         )
 
@@ -344,13 +345,66 @@ def run_evaluate(args) -> bool:
         global_model=global_model,
     )
 
-    # Prepare predictions directory if saving predictions
-    predictions_dir = PREDICTIONS_DIR / args.dataset if args.save_predictions else None
+    # Prepare predictions directory
+    predictions_dir = PREDICTIONS_DIR / args.dataset
+    predictions_dir.mkdir(parents=True, exist_ok=True)
 
     # Run evaluation
-    evaluator.full_evaluation()
-    if args.save_predictions:
-        evaluator.save_predictions(predictions_dir / "predictions.txt")
+    results = evaluator.full_evaluation()
+    evaluator.save_predictions(predictions_dir / "predictions.txt")
+
+    # Run analysis and visualization
+    from src.analysis import AnalysisManager
+
+    analysis_dir = ANALYSIS_DIR / args.dataset
+    analysis_manager = AnalysisManager(analysis_dir)
+
+    # Prepare data for analysis
+    train_data = data_module.train_data
+    valid_data = data_module.val_dataset.data
+    test_timesteps = list(data_module.test_dataset.timesteps)
+
+    # Get ground truth from test set
+    test_data = data_module.test_dataset.data
+    ground_truth = [
+        (int(row[0]), int(row[1]), int(row[2]), int(row[3])) for row in test_data
+    ]
+
+    # Prepare overall metrics
+    overall_metrics = results.get("metrics", {})
+
+    # Prepare per-timestep metrics
+    per_ts = results.get("per_timestep", {})
+    per_timestep_metrics = {
+        "f1": {
+            ts: f1 for ts, f1 in zip(per_ts.get("timesteps", []), per_ts.get("f1s", []))
+        },
+        "auprc": {
+            ts: auprc
+            for ts, auprc in zip(per_ts.get("timesteps", []), per_ts.get("auprcs", []))
+        },
+    }
+
+    # Dataset info
+    dataset_info = {
+        "name": args.dataset,
+        "num_entities": data_module.num_entities,
+        "num_relations": data_module.num_rels,
+        "train_timesteps": len(data_module.train_times),
+        "test_timesteps": len(test_timesteps),
+    }
+
+    # Run analysis
+    analysis_manager.run_analysis(
+        predictions=evaluator.predictions,
+        ground_truth=ground_truth,
+        train_data=train_data,
+        valid_data=valid_data,
+        test_timesteps=test_timesteps,
+        overall_metrics=overall_metrics,
+        per_timestep_metrics=per_timestep_metrics,
+        dataset_info=dataset_info,
+    )
 
     return True
 
@@ -593,6 +647,54 @@ def main():
         help="Fraction of timeline for test set; validation uses same ratio (default: 0.2)",
     )
 
+    # === Multi-Analyze command ===
+    multi_analyze_parser = subparsers.add_parser(
+        "multi-analyze",
+        help="Aggregate and visualize results from multiple replica runs",
+    )
+    multi_analyze_parser.add_argument(
+        "--results_dir",
+        type=str,
+        required=True,
+        help="Base directory containing replica result subdirectories (e.g., results_dir/replica1/analysis/)",
+    )
+    multi_analyze_parser.add_argument(
+        "--pattern",
+        type=str,
+        default="replica*/analysis",
+        help="Glob pattern to find analysis directories (default: replica*/analysis)",
+    )
+    multi_analyze_parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./multi_replica_analysis",
+        help="Output directory for aggregated plots (default: ./multi_replica_analysis)",
+    )
+    multi_analyze_parser.add_argument(
+        "--export_json",
+        type=str,
+        default=None,
+        help="Export aggregated metrics to JSON file",
+    )
+
+    # === Analyze-Raw command ===
+    analyze_raw_parser = subparsers.add_parser(
+        "analyze-raw",
+        help="Analyze raw .interfacea simulation data (temporal dynamics and stability)",
+    )
+    analyze_raw_parser.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="Directory containing complex/replica/.interfacea structure",
+    )
+    analyze_raw_parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./raw_analysis",
+        help="Output directory for plots (default: ./raw_analysis)",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -603,7 +705,7 @@ def main():
     print("RAPID: Recurrent Architecture for Predicting Protein Interaction Dynamics")
     print("=" * 60)
     print(f"Command: {args.command}")
-    if args.command != "preprocess":
+    if args.command not in ("preprocess", "multi-analyze", "analyze-raw"):
         print(f"Dataset: {args.dataset}")
         print(f"GPU: {args.gpu}")
         print(f"Seed: {args.seed}")
@@ -675,6 +777,82 @@ def main():
         # Step 3: Evaluate
         args.checkpoint = str(best_model_path)
         run_evaluate(args)
+
+    elif args.command == "multi-analyze":
+        from src.analysis.multi_replica import MultiReplicaAnalyzer, MultiReplicaPlotter
+        import json
+
+        print("\n" + "=" * 60)
+        print("Multi-Replica Analysis")
+        print("=" * 60)
+
+        analyzer = MultiReplicaAnalyzer()
+        replica_paths = analyzer.discover_replica_directories(
+            Path(args.results_dir), args.pattern
+        )
+
+        if not replica_paths:
+            print("Error: No replica directories found")
+            sys.exit(1)
+
+        if not analyzer.load_replica_metrics(replica_paths):
+            print("Error: Failed to load replica metrics")
+            sys.exit(1)
+
+        aggregated = analyzer.aggregate_metrics()
+        if aggregated is None:
+            print("Error: Failed to aggregate metrics")
+            sys.exit(1)
+
+        # Print summary
+        print(f"\nAggregated {aggregated.n_replicas} replicas:")
+        print(
+            f"  F1:     {aggregated.overall_stats.f1.mean:.4f} ± {aggregated.overall_stats.f1.std:.4f}"
+        )
+        print(
+            f"  Recall: {aggregated.overall_stats.recall.mean:.4f} ± {aggregated.overall_stats.recall.std:.4f}"
+        )
+        print(
+            f"  MCC:    {aggregated.overall_stats.mcc.mean:.4f} ± {aggregated.overall_stats.mcc.std:.4f}"
+        )
+
+        # Generate plots
+        output_dir = Path(args.output_dir)
+        plotter = MultiReplicaPlotter(output_dir)
+        plots = plotter.generate_plots(aggregated)
+        print(f"\nGenerated {len(plots)} plots in {output_dir}")
+
+        # Export JSON if requested
+        if args.export_json:
+            with open(args.export_json, "w") as f:
+                json.dump(aggregated.to_dict(), f, indent=2)
+            print(f"Exported metrics to {args.export_json}")
+
+    elif args.command == "analyze-raw":
+        from src.analysis.raw_analysis import TemporalAnalyzer, StabilityAnalyzer
+
+        print("\n" + "=" * 60)
+        print("Raw Simulation Data Analysis")
+        print("=" * 60)
+
+        output_dir = Path(args.output_dir)
+
+        # Temporal analysis
+        temporal = TemporalAnalyzer(output_dir)
+        if not temporal.load_data(Path(args.data_dir)):
+            print("Error: Failed to load data")
+            sys.exit(1)
+
+        temporal_plots = temporal.generate_plots()
+        print(f"Generated {len(temporal_plots)} temporal dynamics plots")
+
+        # Stability analysis (reuses loaded data)
+        stability = StabilityAnalyzer(output_dir)
+        stability.set_data(temporal.all_data)
+        stability_plots = stability.generate_plots()
+        print(f"Generated {len(stability_plots)} stability distribution plots")
+
+        print(f"\n✓ All plots saved to {output_dir}")
 
     print("\n" + "=" * 60)
     print("Done!")

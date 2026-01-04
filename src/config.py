@@ -17,6 +17,7 @@ class ModelConfig:
 
     # Temporal encoder
     seq_len: int = 10  # History sequence length
+    aggregator: str = "mean"  # Aggregation method
 
     # Classifier head
     classifier_hidden_dim: int = 128
