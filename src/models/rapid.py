@@ -41,6 +41,7 @@ class RAPIDModel(nn.Module):
         num_entities: int,
         num_rels: int,
         config: ModelConfig,
+        node_features: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -55,6 +56,17 @@ class RAPIDModel(nn.Module):
 
         self.rel_embeds = nn.Parameter(torch.Tensor(num_rels, config.hidden_dim))
         nn.init.xavier_uniform_(self.rel_embeds, gain=nn.init.calculate_gain("relu"))
+
+        # Node features (optional)
+        self.use_node_features = node_features is not None
+        if self.use_node_features:
+            self.register_buffer("node_features", node_features)
+            self.node_feature_proj = nn.Linear(
+                node_features.shape[1], config.hidden_dim
+            )
+        else:
+            self.register_buffer("node_features", None)
+            self.node_feature_proj = None
 
         self.rgcn = UndirectedRGCN(
             hidden_dim=config.hidden_dim,
@@ -92,6 +104,24 @@ class RAPIDModel(nn.Module):
         self._global_model: Optional[nn.Module] = None
         self._latest_time: Optional[int] = None
         self._rgcn_cache: Dict[int, torch.Tensor] = {}
+
+    def get_entity_embed(self, entity_ids: torch.Tensor) -> torch.Tensor:
+        """Get entity embeddings, optionally enhanced with node features.
+
+        Args:
+            entity_ids: Entity IDs, shape (batch_size,) or scalar
+
+        Returns:
+            Entity embeddings of shape (batch_size, hidden_dim) or (hidden_dim,)
+        """
+        base_embed = self.entity_embeds[entity_ids]
+
+        if self.use_node_features and self.node_features is not None:
+            feat = self.node_features[entity_ids]
+            feat_proj = self.node_feature_proj(feat)
+            return base_embed + feat_proj
+
+        return base_embed
 
     def _canonical_edge(self, e1: int, e2: int) -> Tuple[int, int]:
         """Return edge in canonical order (smaller id first)."""
@@ -311,9 +341,9 @@ class RAPIDModel(nn.Module):
 
         self._precompute_rgcn(all_timesteps, graph_dict)
 
-        # Get entity embeddings
-        entity1_embed = self.entity_embeds[entity1_ids]
-        entity2_embed = self.entity_embeds[entity2_ids]
+        # Get entity embeddings (with node features if enabled)
+        entity1_embed = self.get_entity_embed(entity1_ids)
+        entity2_embed = self.get_entity_embed(entity2_ids)
 
         # Batch encode temporal embeddings
         entity1_temporal = self._encode_history_batch(
@@ -540,8 +570,8 @@ class RAPIDModel(nn.Module):
         e1 = torch.LongTensor([entity1_id]).to(device)
         e2 = torch.LongTensor([entity2_id]).to(device)
 
-        entity1_embed = self.entity_embeds[e1]
-        entity2_embed = self.entity_embeds[e2]
+        entity1_embed = self.get_entity_embed(e1)
+        entity2_embed = self.get_entity_embed(e2)
 
         # Get temporal embeddings from stored history
         entity1_temporal = self._get_entity_temporal_embed(entity1_id).unsqueeze(0)
@@ -589,8 +619,8 @@ class RAPIDModel(nn.Module):
         batch_size = len(entity1_ids)
         device = self.entity_embeds.device
 
-        entity1_embed = self.entity_embeds[entity1_ids]
-        entity2_embed = self.entity_embeds[entity2_ids]
+        entity1_embed = self.get_entity_embed(entity1_ids)
+        entity2_embed = self.get_entity_embed(entity2_ids)
 
         # Get temporal embeddings
         entity1_temporal = torch.zeros(batch_size, self.hidden_dim, device=device)
@@ -688,6 +718,7 @@ def create_model(
     num_entities: int,
     num_rels: int,
     config: Optional[ModelConfig] = None,
+    node_features: Optional[torch.Tensor] = None,
 ) -> RAPIDModel:
     """
     Factory function to create RAPID model.
@@ -696,6 +727,7 @@ def create_model(
         num_entities: Number of entities
         num_rels: Number of relation types
         config: Model configuration (uses default if None)
+        node_features: Pre-computed node features tensor (optional)
 
     Returns:
         Initialized RAPIDModel
@@ -707,4 +739,5 @@ def create_model(
         num_entities=num_entities,
         num_rels=num_rels,
         config=config,
+        node_features=node_features,
     )

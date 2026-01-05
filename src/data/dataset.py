@@ -376,6 +376,11 @@ class PPIDataModule:
         """Get sorted list of unique training timesteps."""
         return sorted(self.graph_dict.keys())
 
+    @property
+    def train_max_time(self) -> int:
+        """Get maximum timestep in training data (for data leakage prevention)."""
+        return max(self.graph_dict.keys())
+
     def get_train_dataloader(self, shuffle: bool = True):
         """Get training dataloader."""
         # Prepare epoch (regenerate negatives)

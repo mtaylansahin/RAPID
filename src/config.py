@@ -1,7 +1,33 @@
 """Configuration dataclasses for RAPID - Protein Interaction Dynamics prediction."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+
+@dataclass
+class NodeFeatureConfig:
+    """Configuration for node-level features."""
+
+    enabled: bool = True
+    use_physicochemical: bool = True
+    use_intrachain: bool = True
+
+    @property
+    def num_physicochemical(self) -> int:
+        """Number of physicochemical features."""
+        return 5 if self.use_physicochemical else 0
+
+    @property
+    def num_intrachain(self) -> int:
+        """Number of intrachain-derived features."""
+        return 3 if self.use_intrachain else 0
+
+    @property
+    def total_features(self) -> int:
+        """Total number of node features."""
+        if not self.enabled:
+            return 0
+        return self.num_physicochemical + self.num_intrachain
 
 
 @dataclass
@@ -24,6 +50,9 @@ class ModelConfig:
 
     # General
     dropout: float = 0.2
+
+    # Node features
+    node_features: NodeFeatureConfig = field(default_factory=NodeFeatureConfig)
 
 
 @dataclass

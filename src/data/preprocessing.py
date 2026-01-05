@@ -163,23 +163,55 @@ def read_interfacea_files(folder: Path) -> pd.DataFrame:
     return df
 
 
-def encode_entities(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert residue identifiers to integer entity codes.
+def filter_interchain(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only interchain interactions (different chains).
+
+    Args:
+        df: DataFrame with chain_a and chain_b columns
+
+    Returns:
+        Filtered DataFrame containing only interchain interactions
+    """
+    return df[df["chain_a"] != df["chain_b"]].copy()
+
+
+def encode_entities(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
+    """Convert residue identifiers to integer entity codes using unified namespace.
+
+    Uses a single ID space for all entities, so the same residue gets the same ID
+    regardless of whether it appears in entity_a or entity_b.
 
     Args:
         df: DataFrame with interaction data
 
     Returns:
-        DataFrame with encoded entity columns (subject, relation, object, time)
+        Tuple of:
+            - DataFrame with encoded columns (subject, relation, object, time)
+            - Metadata dict with entity_to_id mapping and resname info
     """
     df = df.copy()
     df["relation"] = pd.Categorical(df["itype"]).codes
     df["entity_a"] = df["chain_a"] + df["resid_a"].astype(str)
     df["entity_b"] = df["chain_b"] + df["resid_b"].astype(str)
 
-    df["subject"] = pd.Categorical(df["entity_a"]).codes
-    max_subject = df["subject"].max() + 1
-    df["object"] = pd.Categorical(df["entity_b"]).codes + max_subject
+    # Build unified entity namespace from ALL entities in both columns
+    all_entities = pd.concat([df["entity_a"], df["entity_b"]]).unique()
+    entity_to_id = {entity: idx for idx, entity in enumerate(sorted(all_entities))}
+
+    df["subject"] = df["entity_a"].map(entity_to_id)
+    df["object"] = df["entity_b"].map(entity_to_id)
+
+    # Build resname mapping (entity_str -> 3-letter residue name)
+    resname_map = {}
+    for _, row in df.drop_duplicates(subset=["entity_a"])[
+        ["entity_a", "resname_a"]
+    ].iterrows():
+        resname_map[row["entity_a"]] = row["resname_a"]
+    for _, row in df.drop_duplicates(subset=["entity_b"])[
+        ["entity_b", "resname_b"]
+    ].iterrows():
+        if row["entity_b"] not in resname_map:
+            resname_map[row["entity_b"]] = row["resname_b"]
 
     dataset = pd.DataFrame(
         {
@@ -192,7 +224,13 @@ def encode_entities(df: pd.DataFrame) -> pd.DataFrame:
 
     dataset = dataset.sort_values("time").drop_duplicates().reset_index(drop=True)
 
-    return dataset
+    metadata = {
+        "entity_to_id": entity_to_id,
+        "id_to_entity": {v: k for k, v in entity_to_id.items()},
+        "resname_map": resname_map,
+    }
+
+    return dataset, metadata
 
 
 def split_by_time(
@@ -222,16 +260,17 @@ def split_by_time(
     return train, valid, test
 
 
-def compute_statistics(dataset: pd.DataFrame) -> Tuple[int, int, int]:
+def compute_statistics(dataset: pd.DataFrame, metadata: dict) -> Tuple[int, int, int]:
     """Compute dataset statistics.
 
     Args:
         dataset: Full dataset
+        metadata: Entity metadata from encode_entities
 
     Returns:
         Tuple of (num_entities, num_relations, num_timesteps)
     """
-    num_entities = len(set(dataset["subject"])) + len(set(dataset["object"]))
+    num_entities = len(metadata["entity_to_id"])
     num_relations = len(set(dataset["relation"]))
     num_timesteps = len(set(dataset["time"]))
 
@@ -262,12 +301,21 @@ def run_preprocessing(config: PreprocessingConfig) -> PreprocessingResult:
                 output_directory=config.output_directory,
             )
 
-        dataset = encode_entities(df)
+        # Encode all entities with unified namespace
+        dataset, metadata = encode_entities(df)
+
+        # Filter to interchain only for training/evaluation
+        interchain_df = filter_interchain(df)
+        interchain_dataset, _ = encode_entities(interchain_df)
+
+        # Use interchain dataset for train/valid/test splits
         train, valid, test = split_by_time(
-            dataset, config.train_ratio, config.valid_ratio
+            interchain_dataset, config.train_ratio, config.valid_ratio
         )
 
-        num_entities, num_relations, num_timesteps = compute_statistics(dataset)
+        num_entities, num_relations, num_timesteps = compute_statistics(
+            dataset, metadata
+        )
 
         logger.info(f"Writing output files to {config.output_directory}")
 
@@ -278,8 +326,16 @@ def run_preprocessing(config: PreprocessingConfig) -> PreprocessingResult:
         np.savetxt(config.output_directory / "valid.txt", valid.values, fmt="%d")
         np.savetxt(config.output_directory / "test.txt", test.values, fmt="%d")
 
+        # Save raw labels
         labels_path = config.output_directory / "labels.txt"
         df.to_csv(labels_path, sep=" ", index=False, header=True)
+
+        # Save metadata for node features
+        import json
+
+        metadata_path = config.output_directory / "metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
         logger.info("Preprocessing complete")
 

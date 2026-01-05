@@ -59,6 +59,7 @@ data/*/valid_history_sub.txt
 data/*/valid_history_ob.txt
 data/*/test_history_sub.txt
 data/*/test_history_ob.txt
+data/raw/*
 
 # OS files
 .DS_Store

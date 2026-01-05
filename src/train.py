@@ -313,6 +313,15 @@ class Trainer:
                     "hidden_dim": self.model.hidden_dim,
                     "seq_len": self.model.seq_len,
                 },
+                "node_features": {
+                    "enabled": self.model.use_node_features,
+                    "use_physicochemical": getattr(
+                        self.model.config.node_features, "use_physicochemical", True
+                    ),
+                    "use_intrachain": getattr(
+                        self.model.config.node_features, "use_intrachain", True
+                    ),
+                },
             },
             "metrics": metrics.to_dict(),
             "optimal_threshold": self.optimal_threshold,

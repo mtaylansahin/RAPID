@@ -36,9 +36,10 @@ import torch
 import torch.nn as nn
 
 # Internal imports
-from src.config import ModelConfig, TrainingConfig
+from src.config import ModelConfig, NodeFeatureConfig, TrainingConfig
 from src.data.dataset import PPIDataModule
 from src.data.preprocessing import PreprocessingConfig, run_preprocessing
+from src.data.node_features import compute_node_features
 from src.evaluate import Evaluator
 from src.analysis import AnalysisConfig, ResultsManager
 from src.models.global_model import create_global_model
@@ -213,12 +214,36 @@ def run_train(args) -> Path:
         seed=args.seed,
     )
 
+    # Compute node features if enabled
+    node_features = None
+    if not getattr(args, "no_node_features", False):
+        print("\nComputing node features...")
+        node_feature_config = NodeFeatureConfig(
+            enabled=True,
+            use_physicochemical=not getattr(args, "no_physicochemical", False),
+            use_intrachain=not getattr(args, "no_intrachain_features", False),
+        )
+        # Get train cutoff for data leakage prevention
+        train_cutoff = data_module.train_max_time
+        node_features = compute_node_features(
+            config=node_feature_config,
+            data_dir=DATA_DIR / args.dataset,
+            train_cutoff=train_cutoff,
+        )
+        if node_features is not None:
+            print(f"  Node features shape: {node_features.shape}")
+        model_config.node_features = node_feature_config
+    else:
+        print("\nNode features disabled.")
+        model_config.node_features = NodeFeatureConfig(enabled=False)
+
     # Create model
     print("\nCreating model...")
     model = create_model(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
         config=model_config,
+        node_features=node_features,
     )
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -308,10 +333,44 @@ def run_evaluate(args) -> bool:
     else:
         model_config = ModelConfig()
 
+    # Check if model was trained with node features (from checkpoint)
+    node_features_enabled = False
+    use_physicochemical = True
+    use_intrachain = True
+    if "config" in checkpoint and "node_features" in checkpoint["config"]:
+        nf_config = checkpoint["config"]["node_features"]
+        node_features_enabled = nf_config.get("enabled", False)
+        use_physicochemical = nf_config.get("use_physicochemical", True)
+        use_intrachain = nf_config.get("use_intrachain", True)
+
+    # Override model config with checkpoint values
+    model_config.node_features = NodeFeatureConfig(
+        enabled=node_features_enabled,
+        use_physicochemical=use_physicochemical,
+        use_intrachain=use_intrachain,
+    )
+
+    # Compute node features if model was trained with them
+    node_features = None
+    if node_features_enabled:
+        print("\nComputing node features...")
+        print(f"  Physicochemical: {use_physicochemical}, Intrachain: {use_intrachain}")
+        train_cutoff = data_module.train_max_time
+        node_features = compute_node_features(
+            config=model_config.node_features,
+            data_dir=DATA_DIR / args.dataset,
+            train_cutoff=train_cutoff,
+        )
+        if node_features is not None:
+            print(f"  Node features shape: {node_features.shape}")
+    else:
+        print("\nNode features: disabled (model trained without)")
+
     model = create_model(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
         config=model_config,
+        node_features=node_features,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
 
@@ -445,6 +504,22 @@ def main():
         default=None,
         help="Experiment name for checkpoints",
     )
+    # Node feature flags
+    train_parser.add_argument(
+        "--no_node_features",
+        action="store_true",
+        help="Disable all node features",
+    )
+    train_parser.add_argument(
+        "--no_physicochemical",
+        action="store_true",
+        help="Disable physicochemical features (only use intrachain)",
+    )
+    train_parser.add_argument(
+        "--no_intrachain_features",
+        action="store_true",
+        help="Disable intrachain features (only use physicochemical)",
+    )
 
     # === Evaluate command ===
     eval_parser = subparsers.add_parser(
@@ -559,6 +634,22 @@ def main():
         type=str,
         default=PREDICTIONS_DIR,
         help="Directory to save prediction files",
+    )
+    # Node feature flags
+    all_parser.add_argument(
+        "--no_node_features",
+        action="store_true",
+        help="Disable all node features",
+    )
+    all_parser.add_argument(
+        "--no_physicochemical",
+        action="store_true",
+        help="Disable physicochemical features (only use intrachain)",
+    )
+    all_parser.add_argument(
+        "--no_intrachain_features",
+        action="store_true",
+        help="Disable intrachain features (only use physicochemical)",
     )
 
     # === Preprocess command ===
