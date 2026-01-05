@@ -353,9 +353,6 @@ def run_evaluate(args) -> bool:
     evaluator.full_evaluation()
     evaluator.save_predictions(predictions_path)
 
-    if not args.save_predictions:
-        print("Note: Predictions saved for analysis despite --no_save_predictions.")
-
     # Run analysis + visualization outputs
     analysis_output_dir = Path("analysis_outputs") / Path(checkpoint_path).parent.name
     analysis_config = AnalysisConfig(
@@ -469,14 +466,9 @@ def main():
     )
     # Prediction output options
     eval_parser.add_argument(
-        "--save_predictions",
-        action="store_true",
-        help="Save predicted interactions to text file",
-    )
-    eval_parser.add_argument(
         "--predictions_dir",
         type=str,
-        default="./predictions",
+        default=PREDICTIONS_DIR,
         help="Directory to save prediction files",
     )
 
@@ -563,21 +555,9 @@ def main():
     )
     # Prediction output options
     all_parser.add_argument(
-        "--save_predictions",
-        action="store_true",
-        default=True,
-        help="Save predicted interactions to text file (default: True)",
-    )
-    all_parser.add_argument(
-        "--no_save_predictions",
-        action="store_false",
-        dest="save_predictions",
-        help="Disable saving predictions to file",
-    )
-    all_parser.add_argument(
         "--predictions_dir",
         type=str,
-        default="./predictions",
+        default=PREDICTIONS_DIR,
         help="Directory to save prediction files",
     )
 
