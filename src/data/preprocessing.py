@@ -73,9 +73,12 @@ def discover_interfacea_folder(data_directory: Path, replica: str) -> Path:
     Expected structure:
         <data_directory>/<replica>/rep<NUM>-interfacea/
 
+    Example:
+        data/raw/1JPS/full-interactions/replica1/rep1-interfacea/
+
     Args:
-        data_directory: Root data directory
-        replica: Replica name (e.g., "replica1")
+        data_directory: Root data directory (e.g., "data/raw/1JPS/full-interactions")
+        replica: Replica name (e.g., "replica1", "replica2")
 
     Returns:
         Path to the interfacea folder
@@ -83,7 +86,12 @@ def discover_interfacea_folder(data_directory: Path, replica: str) -> Path:
     Raises:
         FileNotFoundError: If the expected directory structure is not found
     """
-    replica_num = replica.replace("replica", "")
+    # Extract just the number from replica name (e.g., "replica1-full" -> "1")
+    replica_num_match = re.search(r"replica(\d+)", replica)
+    if not replica_num_match:
+        raise ValueError(f"Could not extract replica number from: {replica}")
+    replica_num = replica_num_match.group(1)
+
     replica_dir = data_directory / replica
     if not replica_dir.exists():
         raise FileNotFoundError(f"Replica directory not found: {replica_dir}")

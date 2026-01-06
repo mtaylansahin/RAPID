@@ -58,6 +58,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+/analysis_outputs
 
 # Misc
 *.bak
