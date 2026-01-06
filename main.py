@@ -198,6 +198,8 @@ def run_train(args) -> Path:
         max_epochs=args.epochs,
         patience=args.patience,
         focal_gamma=args.focal_gamma,
+        pair_masking_prob=getattr(args, "pair_masking", 1.0),
+        pair_masking_warmup=getattr(args, "pair_masking_warmup", 5),
     )
 
     # Setup paths
@@ -520,6 +522,18 @@ def main():
         action="store_true",
         help="Disable intrachain features (only use physicochemical)",
     )
+    train_parser.add_argument(
+        "--pair_masking",
+        type=float,
+        default=1.0,
+        help="Probability of masking pair from history (0=off, 1=always, default: 1.0)",
+    )
+    train_parser.add_argument(
+        "--pair_masking_warmup",
+        type=int,
+        default=5,
+        help="Epochs to linearly ramp masking prob from 0 to target (default: 5)",
+    )
 
     # === Evaluate command ===
     eval_parser = subparsers.add_parser(
@@ -650,6 +664,18 @@ def main():
         "--no_intrachain_features",
         action="store_true",
         help="Disable intrachain features (only use physicochemical)",
+    )
+    all_parser.add_argument(
+        "--pair_masking",
+        type=float,
+        default=1.0,
+        help="Probability of masking pair from history (0=off, 1=always, default: 1.0)",
+    )
+    all_parser.add_argument(
+        "--pair_masking_warmup",
+        type=int,
+        default=5,
+        help="Epochs to linearly ramp masking prob from 0 to target (default: 5)",
     )
 
     # === Preprocess command ===

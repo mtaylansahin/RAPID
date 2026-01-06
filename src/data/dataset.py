@@ -209,8 +209,15 @@ class PPIDataModule:
         self.num_entities = self.train_dataset.num_entities
         self.num_rels = self.train_dataset.num_rels
 
+        # Pair history masking (set by trainer each epoch)
+        self._current_masking_prob = 0.0
+
         self.graph_dict = self._build_graph_dict()
         self.entity_history, self.entity_history_t = self._build_histories()
+
+    def set_masking_prob(self, prob: float) -> None:
+        """Set current pair masking probability (called by trainer each epoch)."""
+        self._current_masking_prob = prob
 
     def _build_graph_dict(self) -> Dict[int, dgl.DGLGraph]:
         """Build DGL graphs for each timestep from training data."""
@@ -436,6 +443,40 @@ class PPIDataModule:
 
         return np.array(pairs), np.array(labels)
 
+    def _mask_pair_from_history(
+        self,
+        history: List[Dict],
+        partner_id: int,
+    ) -> List[Dict]:
+        """
+        Remove a specific entity from all neighbor lists in history.
+
+        This implements "pair masking" — when predicting (e1, e2), we hide
+        evidence of their past interactions to prevent the model from learning
+        a simple persistence shortcut.
+
+        Args:
+            history: List of history entries, each with 'neighbors' and 'rel_types'
+            partner_id: Entity ID to remove from neighbor lists
+
+        Returns:
+            New history list with partner_id removed from all entries
+        """
+        masked_history = []
+        for entry in history:
+            mask = [n != partner_id for n in entry["neighbors"]]
+            masked_neighbors = [n for n, m in zip(entry["neighbors"], mask) if m]
+            masked_rels = [r for r, m in zip(entry["rel_types"], mask) if m]
+
+            masked_history.append(
+                {
+                    "neighbors": masked_neighbors,
+                    "rel_types": masked_rels,
+                }
+            )
+
+        return masked_history
+
     def _collate_fn(self, batch: List[Dict]) -> Dict:
         """Collate batch of samples."""
         entity1 = torch.LongTensor([b["entity1"] for b in batch])
@@ -466,6 +507,12 @@ class PPIDataModule:
                 if ht < t
             ]
             e2_hist_t = [ht for ht in self.entity_history_t[e2] if ht < t]
+
+            # Apply pair masking: remove e2 from e1's history and vice versa
+            if self._current_masking_prob > 0:
+                if np.random.random() < self._current_masking_prob:
+                    e1_hist = self._mask_pair_from_history(e1_hist, e2)
+                    e2_hist = self._mask_pair_from_history(e2_hist, e1)
 
             entity1_history.append(e1_hist)
             entity1_history_t.append(e1_hist_t)

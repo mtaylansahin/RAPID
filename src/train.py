@@ -97,6 +97,17 @@ class Trainer:
         self.model.train()
         self.train_metrics.reset()
 
+        # Compute masking probability for this epoch (curriculum)
+        if self.config.pair_masking_warmup > 0:
+            masking_prob = min(
+                self.config.pair_masking_prob,
+                self.config.pair_masking_prob * epoch / self.config.pair_masking_warmup,
+            )
+        else:
+            masking_prob = self.config.pair_masking_prob
+
+        self.data_module.set_masking_prob(masking_prob)
+
         dataloader = self.data_module.get_train_dataloader()
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch:03d} [Train]")

@@ -72,5 +72,9 @@ class TrainingConfig:
     focal_gamma: float = 2.0
     focal_alpha: Optional[float] = None  # If None, no class weighting
 
+    # Pair history masking
+    pair_masking_prob: float = 1.0  # Probability of masking pair from history
+    pair_masking_warmup: int = 5  # Epochs to linearly ramp from 0 to target
+
     # Logging
     eval_interval: int = 1  # Evaluate every N epochs
