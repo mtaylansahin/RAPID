@@ -48,6 +48,14 @@ class ModelConfig:
     classifier_hidden_dim: int = 128
     classifier_dropout: float = 0.2
 
+    # Transition prediction mode
+    # If True, predicts P(transition) instead of P(edge exists)
+    use_transition_prediction: bool = False
+
+    # Attention encoder mode
+    # If True, uses TransformerEncoder instead of GRU for temporal encoding
+    use_attention_encoder: bool = False
+
     # General
     dropout: float = 0.2
 

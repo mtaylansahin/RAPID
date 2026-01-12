@@ -1,5 +1,6 @@
 """Classification metrics for PPI dynamics prediction."""
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,7 @@ import torch
 from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
+    matthews_corrcoef,
     precision_recall_curve,
     precision_recall_fscore_support,
     roc_auc_score,
@@ -347,3 +349,162 @@ def find_optimal_threshold(
     # Find best threshold
     best_idx = np.argmax(f1_scores[:-1])  # Last element is placeholder
     return float(thresholds[best_idx])
+
+
+@dataclass
+class TransitionMetrics:
+    """
+    Metrics for evaluating transition prediction (dynamics vs persistence).
+    
+    Treats both forming (OFF→ON) and breaking (ON→OFF) as "transitions".
+    Measures how well the model detects state changes vs predicting persistence.
+    """
+    
+    # Transition detection confusion matrix
+    # TP: Correctly predicted a transition
+    # TN: Correctly predicted persistence (no change)
+    # FP: Wrongly predicted transition (actually persisted)
+    # FN: Missed a transition (actually changed)
+    transition_tp: int = 0
+    transition_fp: int = 0
+    transition_tn: int = 0
+    transition_fn: int = 0
+    
+    # Breakdown by transition type
+    forming_correct: int = 0  # OFF→ON, predicted ON
+    forming_missed: int = 0   # OFF→ON, predicted OFF
+    breaking_correct: int = 0  # ON→OFF, predicted OFF
+    breaking_missed: int = 0   # ON→OFF, predicted ON
+    
+    # MCC for transition detection
+    mcc: float = 0.0
+    
+    @property
+    def transition_precision(self) -> float:
+        """Of predicted transitions, how many were real?"""
+        denom = self.transition_tp + self.transition_fp
+        return self.transition_tp / denom if denom > 0 else 0.0
+    
+    @property
+    def transition_recall(self) -> float:
+        """Of real transitions, how many did we catch?"""
+        denom = self.transition_tp + self.transition_fn
+        return self.transition_tp / denom if denom > 0 else 0.0
+    
+    @property
+    def transition_f1(self) -> float:
+        """F1 for transition detection."""
+        p, r = self.transition_precision, self.transition_recall
+        return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+    
+    @property
+    def persistence_accuracy(self) -> float:
+        """Of persistent pairs, how many did we correctly predict?"""
+        denom = self.transition_tn + self.transition_fp
+        return self.transition_tn / denom if denom > 0 else 0.0
+    
+    @property
+    def balanced_accuracy(self) -> float:
+        """Average of transition recall and persistence accuracy."""
+        return (self.transition_recall + self.persistence_accuracy) / 2
+    
+    @property
+    def forming_recall(self) -> float:
+        """Of OFF→ON transitions, how many did we catch?"""
+        denom = self.forming_correct + self.forming_missed
+        return self.forming_correct / denom if denom > 0 else 0.0
+    
+    @property
+    def breaking_recall(self) -> float:
+        """Of ON→OFF transitions, how many did we catch?"""
+        denom = self.breaking_correct + self.breaking_missed
+        return self.breaking_correct / denom if denom > 0 else 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "transition_tp": self.transition_tp,
+            "transition_fp": self.transition_fp,
+            "transition_tn": self.transition_tn,
+            "transition_fn": self.transition_fn,
+            "transition_precision": self.transition_precision,
+            "transition_recall": self.transition_recall,
+            "transition_f1": self.transition_f1,
+            "persistence_accuracy": self.persistence_accuracy,
+            "balanced_accuracy": self.balanced_accuracy,
+            "mcc": self.mcc,
+            "forming_correct": self.forming_correct,
+            "forming_missed": self.forming_missed,
+            "breaking_correct": self.breaking_correct,
+            "breaking_missed": self.breaking_missed,
+            "forming_recall": self.forming_recall,
+            "breaking_recall": self.breaking_recall,
+        }
+    
+    def __str__(self) -> str:
+        return (
+            f"TransitionMetrics: MCC={self.mcc:.4f} | "
+            f"Trans F1={self.transition_f1:.4f} (P={self.transition_precision:.4f}, R={self.transition_recall:.4f}) | "
+            f"Forming R={self.forming_recall:.4f} | Breaking R={self.breaking_recall:.4f}"
+        )
+
+
+def compute_transition_metrics(
+    predictions: np.ndarray,
+    labels: np.ndarray,
+    prev_labels: np.ndarray,
+) -> TransitionMetrics:
+    """
+    Compute transition-focused metrics.
+    
+    Args:
+        predictions: Binary predictions (0/1), shape (N,)
+        labels: Ground truth labels at time t, shape (N,)
+        prev_labels: Labels at time t-1, shape (N,)
+            NOTE: For test set, this should be PREDICTED labels from t-1
+            to avoid leakage, not ground truth!
+    
+    Returns:
+        TransitionMetrics with all computed values
+    """
+    predictions = np.asarray(predictions).astype(int)
+    labels = np.asarray(labels).astype(int)
+    prev_labels = np.asarray(prev_labels).astype(int)
+    
+    # Ground truth transitions
+    is_transition = (labels != prev_labels)
+    
+    # Model-predicted transitions
+    predicted_transition = (predictions != prev_labels)
+    
+    # Transition detection confusion matrix
+    transition_tp = int(np.sum(is_transition & predicted_transition))
+    transition_fp = int(np.sum(~is_transition & predicted_transition))
+    transition_tn = int(np.sum(~is_transition & ~predicted_transition))
+    transition_fn = int(np.sum(is_transition & ~predicted_transition))
+    
+    # Breakdown by transition type
+    is_forming = (labels == 1) & (prev_labels == 0)  # OFF→ON
+    is_breaking = (labels == 0) & (prev_labels == 1)  # ON→OFF
+    
+    forming_correct = int(np.sum(is_forming & (predictions == 1)))
+    forming_missed = int(np.sum(is_forming & (predictions == 0)))
+    breaking_correct = int(np.sum(is_breaking & (predictions == 0)))
+    breaking_missed = int(np.sum(is_breaking & (predictions == 1)))
+    
+    # MCC for transition detection
+    try:
+        mcc = matthews_corrcoef(is_transition.astype(int), predicted_transition.astype(int))
+    except Exception:
+        mcc = 0.0
+    
+    return TransitionMetrics(
+        transition_tp=transition_tp,
+        transition_fp=transition_fp,
+        transition_tn=transition_tn,
+        transition_fn=transition_fn,
+        forming_correct=forming_correct,
+        forming_missed=forming_missed,
+        breaking_correct=breaking_correct,
+        breaking_missed=breaking_missed,
+        mcc=float(mcc),
+    )

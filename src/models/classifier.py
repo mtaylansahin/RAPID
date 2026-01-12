@@ -170,3 +170,148 @@ class SymmetricEdgeClassifier(EdgeClassifier):
 
         # Average for symmetry
         return (logits_12 + logits_21) / 2
+
+
+class TransitionEdgeClassifier(nn.Module):
+    """
+    Edge classifier that predicts P(transition) instead of P(edge exists).
+
+    This reformulates the problem to directly predict state changes:
+    - P(transition) = P(state changes from t-1 to t)
+
+    The model does NOT receive was_on_t_minus_1 as input - it must learn to
+    detect transitions from temporal patterns. The XOR conversion to edge
+    predictions happens only at inference time via get_edge_logits().
+
+    Args:
+        hidden_dim: Entity embedding dimension
+        classifier_hidden_dim: Hidden dimension in classifier MLP
+        dropout: Dropout rate
+        use_temporal: Whether to include temporal embeddings
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        classifier_hidden_dim: int = 128,
+        dropout: float = 0.2,
+        use_temporal: bool = True,
+    ):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.use_temporal = use_temporal
+
+        # Input: e1 + e2 + (optional: e1_temp + e2_temp)
+        # Note: was_on is NOT included as input - model learns from temporal context
+        input_dim = 2 * hidden_dim
+        if use_temporal:
+            input_dim += 2 * hidden_dim
+
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, classifier_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden_dim, classifier_hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden_dim // 2, 1),
+        )
+
+    def forward(
+        self,
+        entity1_embed: torch.Tensor,
+        entity2_embed: torch.Tensor,
+        entity1_temporal: Optional[torch.Tensor] = None,
+        entity2_temporal: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute P(transition) logits.
+
+        Args:
+            entity1_embed: (batch_size, hidden_dim)
+            entity2_embed: (batch_size, hidden_dim)
+            entity1_temporal: (batch_size, hidden_dim)
+            entity2_temporal: (batch_size, hidden_dim)
+
+        Returns:
+            transition_logits: (batch_size,) - logits for P(transition)
+        """
+        # Build input features - no was_on, must learn from temporal patterns
+        inputs = [entity1_embed, entity2_embed]
+
+        if self.use_temporal:
+            if entity1_temporal is not None:
+                inputs.append(entity1_temporal)
+            else:
+                inputs.append(torch.zeros_like(entity1_embed))
+
+            if entity2_temporal is not None:
+                inputs.append(entity2_temporal)
+            else:
+                inputs.append(torch.zeros_like(entity2_embed))
+
+        x = torch.cat(inputs, dim=-1)
+        transition_logits = self.classifier(x).squeeze(-1)
+
+        return transition_logits
+
+    def get_edge_logits(
+        self,
+        entity1_embed: torch.Tensor,
+        entity2_embed: torch.Tensor,
+        was_on_t_minus_1: torch.Tensor,
+        entity1_temporal: Optional[torch.Tensor] = None,
+        entity2_temporal: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Convert transition logits to edge existence logits.
+
+        This is used at INFERENCE TIME ONLY to convert P(transition) to P(edge).
+        The was_on_t_minus_1 is only used here for XOR conversion, not as model input.
+
+        Returns:
+            edge_logits: (batch_size,) - logits for P(edge exists at t)
+        """
+        transition_logits = self.forward(
+            entity1_embed, entity2_embed, entity1_temporal, entity2_temporal
+        )
+
+        # Convert P(transition) to P(on)
+        # If was_on: P(on) = 1 - P(transition) = sigmoid(-transition_logits)
+        # If was_off: P(on) = P(transition) = sigmoid(transition_logits)
+        # In logit space: negate logits when was_on
+        was_on = was_on_t_minus_1.float()
+        edge_logits = transition_logits * (1 - 2 * was_on)  # Negate when was_on=1
+
+        return edge_logits
+
+
+class SymmetricTransitionClassifier(TransitionEdgeClassifier):
+    """
+    Symmetric version of TransitionEdgeClassifier for undirected graphs.
+    """
+
+    def forward(
+        self,
+        entity1_embed: torch.Tensor,
+        entity2_embed: torch.Tensor,
+        entity1_temporal: Optional[torch.Tensor] = None,
+        entity2_temporal: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Average scores in both directions for symmetry."""
+        logits_12 = super().forward(
+            entity1_embed,
+            entity2_embed,
+            entity1_temporal,
+            entity2_temporal,
+        )
+
+        logits_21 = super().forward(
+            entity2_embed,
+            entity1_embed,
+            entity2_temporal,
+            entity1_temporal,
+        )
+
+        return (logits_12 + logits_21) / 2

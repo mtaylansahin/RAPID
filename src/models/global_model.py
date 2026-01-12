@@ -255,10 +255,10 @@ class PPIGlobalModel(nn.Module):
 
     Architecture:
     1. GlobalRGCNAggregator: RGCN + pooling on each timestep graph
-    2. GRU: Encodes sequence of graph embeddings
+    2. Temporal encoder (GRU or Transformer): Encodes sequence of graph embeddings
     3. Linear: Projects to prediction space (for pretraining)
 
-    During inference, the GRU hidden state is used as global context
+    During inference, the encoder hidden state is used as global context
     to enrich per-entity predictions.
 
     Args:
@@ -269,6 +269,9 @@ class PPIGlobalModel(nn.Module):
         seq_len: Maximum history length
         pooling: Graph pooling method
         dropout: Dropout rate
+        encoder_type: "gru" or "transformer"
+        num_heads: Number of attention heads (for transformer)
+        num_transformer_layers: Number of transformer layers
     """
 
     def __init__(
@@ -280,6 +283,9 @@ class PPIGlobalModel(nn.Module):
         seq_len: int = 10,
         pooling: str = "max",
         dropout: float = 0.2,
+        encoder_type: str = "gru",
+        num_heads: int = 4,
+        num_transformer_layers: int = 2,
     ):
         super().__init__()
 
@@ -287,6 +293,7 @@ class PPIGlobalModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_rels = num_rels
         self.seq_len = seq_len
+        self.encoder_type = encoder_type
 
         # Entity embeddings (shared with main model during training)
         self.ent_embeds = nn.Parameter(torch.Tensor(num_entities, hidden_dim))
@@ -302,11 +309,41 @@ class PPIGlobalModel(nn.Module):
             dropout=dropout,
         )
 
-        # Temporal encoder
-        self.encoder = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        # Temporal encoder (GRU or Transformer)
+        if encoder_type == "transformer":
+            # Learned positional encoding
+            self.pos_encoding = nn.Parameter(torch.randn(seq_len, hidden_dim) * 0.1)
+
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_transformer_layers,
+            )
+            self.encoder_output_proj = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            # Default GRU
+            self.encoder = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+            self.pos_encoding = None
+            self.encoder_output_proj = None
 
         # Projection for pretraining (predict entity distribution)
         self.linear = nn.Linear(hidden_dim, num_entities)
+
+        # Edge predictor for graph reconstruction pretraining
+        # Takes concatenated entity embeddings + global embedding and predicts edge
+        self.edge_predictor = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),  # 2 entities + global
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
 
         self.dropout = nn.Dropout(dropout)
 
@@ -363,9 +400,35 @@ class PPIGlobalModel(nn.Module):
         # Get packed graph embeddings
         packed_input = self.aggregator(sorted_t, self.ent_embeds, graph_dict)
 
-        # Encode with GRU
-        _, hidden = self.encoder(packed_input)
-        hidden = hidden.squeeze(0)  # (batch, hidden_dim)
+        # Encode based on encoder type
+        if self.encoder_type == "transformer":
+            # Unpack for transformer (needs padded tensor, not packed)
+            padded_input, lengths = torch.nn.utils.rnn.pad_packed_sequence(
+                packed_input, batch_first=True
+            )
+
+            # Add positional encoding
+            seq_len = padded_input.size(1)
+            pos_enc = self.pos_encoding[:seq_len, :]  # Slice to actual seq length
+            padded_input = padded_input + pos_enc.unsqueeze(0)
+
+            # Create attention mask (True = masked out)
+            max_len = padded_input.size(1)
+            mask = torch.arange(max_len, device=padded_input.device).unsqueeze(0)
+            mask = mask >= lengths.unsqueeze(1)
+
+            # Transformer encoding
+            encoded = self.encoder(padded_input, src_key_padding_mask=mask)
+
+            # Pool: use mean of valid positions
+            lengths_float = lengths.float().unsqueeze(1).to(encoded.device)
+            mask_expanded = (~mask).float().unsqueeze(-1)
+            hidden = (encoded * mask_expanded).sum(dim=1) / lengths_float.clamp(min=1)
+            hidden = self.encoder_output_proj(hidden)
+        else:
+            # GRU encoding
+            _, hidden = self.encoder(packed_input)
+            hidden = hidden.squeeze(0)  # (batch, hidden_dim)
 
         # Pad to original batch size if needed
         if len(hidden) < len(t_list):
@@ -388,6 +451,62 @@ class PPIGlobalModel(nn.Module):
         """Soft cross-entropy with probability targets."""
         log_probs = F.log_softmax(pred, dim=-1)
         loss = -(target * log_probs).sum(dim=-1).mean()
+        return loss
+
+    def edge_prediction_forward(
+        self,
+        timestep: int,
+        pos_edges: torch.Tensor,
+        neg_edges: torch.Tensor,
+        graph_dict: Dict[int, dgl.DGLGraph],
+    ) -> torch.Tensor:
+        """
+        Graph reconstruction pretraining - predict edge existence.
+
+        Uses global embedding from history < timestep to predict edges at timestep.
+
+        Args:
+            timestep: Target timestep to predict edges for
+            pos_edges: Positive edges (e1, e2), shape (num_pos, 2)
+            neg_edges: Negative edges (e1, e2), shape (num_neg, 2)
+            graph_dict: Dict of timestep -> graph
+
+        Returns:
+            BCE loss for edge prediction
+        """
+        # Get global embedding for this timestep (uses history < timestep)
+        global_emb = self.predict(timestep, graph_dict)  # (hidden_dim,)
+
+        # Get entity embeddings for positive edges
+        pos_e1_embed = self.ent_embeds[pos_edges[:, 0]]  # (num_pos, hidden_dim)
+        pos_e2_embed = self.ent_embeds[pos_edges[:, 1]]  # (num_pos, hidden_dim)
+
+        # Expand global embedding for concatenation
+        global_emb_pos = global_emb.unsqueeze(0).expand(len(pos_edges), -1)
+
+        # Concatenate and predict for positive edges
+        pos_input = torch.cat([pos_e1_embed, pos_e2_embed, global_emb_pos], dim=-1)
+        pos_logits = self.edge_predictor(pos_input).squeeze(-1)  # (num_pos,)
+
+        # Get entity embeddings for negative edges
+        neg_e1_embed = self.ent_embeds[neg_edges[:, 0]]
+        neg_e2_embed = self.ent_embeds[neg_edges[:, 1]]
+
+        global_emb_neg = global_emb.unsqueeze(0).expand(len(neg_edges), -1)
+
+        neg_input = torch.cat([neg_e1_embed, neg_e2_embed, global_emb_neg], dim=-1)
+        neg_logits = self.edge_predictor(neg_input).squeeze(-1)  # (num_neg,)
+
+        # Compute BCE loss
+        logits = torch.cat([pos_logits, neg_logits])
+        labels = torch.cat(
+            [
+                torch.ones(len(pos_edges), device=logits.device),
+                torch.zeros(len(neg_edges), device=logits.device),
+            ]
+        )
+
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
         return loss
 
     @torch.no_grad()
@@ -457,10 +576,24 @@ class PPIGlobalModel(nn.Module):
         # Get sequence of graph embeddings
         graph_embs = self.aggregator.predict(t, self.ent_embeds, graph_dict)
 
-        # Encode with GRU
-        _, hidden = self.encoder(graph_embs.unsqueeze(0))
+        if self.encoder_type == "transformer":
+            # Add positional encoding
+            seq_len = graph_embs.size(0)
+            if seq_len > 0:
+                pos_enc = self.pos_encoding[:seq_len, :]
+                graph_embs = graph_embs + pos_enc
 
-        return hidden.squeeze()
+            # Transformer expects (batch, seq, hidden)
+            encoded = self.encoder(graph_embs.unsqueeze(0))
+
+            # Pool: mean over sequence
+            hidden = encoded.mean(dim=1)
+            hidden = self.encoder_output_proj(hidden)
+            return hidden.squeeze(0)
+        else:
+            # GRU encoding
+            _, hidden = self.encoder(graph_embs.unsqueeze(0))
+            return hidden.squeeze()
 
     def get_embedding_for_timestep(
         self,
@@ -528,8 +661,24 @@ def create_global_model(
     seq_len: int = 10,
     pooling: str = "max",
     dropout: float = 0.2,
+    encoder_type: str = "gru",
+    num_heads: int = 4,
+    num_transformer_layers: int = 2,
 ) -> PPIGlobalModel:
-    """Factory function for creating global model."""
+    """Factory function for creating global model.
+
+    Args:
+        num_entities: Number of entities
+        num_rels: Number of relation types
+        hidden_dim: Hidden dimension
+        num_bases: Number of RGCN bases
+        seq_len: Maximum history length
+        pooling: Graph pooling method ("max" or "mean")
+        dropout: Dropout rate
+        encoder_type: "gru" or "transformer"
+        num_heads: Number of attention heads (for transformer)
+        num_transformer_layers: Number of transformer layers
+    """
     return PPIGlobalModel(
         num_entities=num_entities,
         hidden_dim=hidden_dim,
@@ -538,4 +687,7 @@ def create_global_model(
         seq_len=seq_len,
         pooling=pooling,
         dropout=dropout,
+        encoder_type=encoder_type,
+        num_heads=num_heads,
+        num_transformer_layers=num_transformer_layers,
     )

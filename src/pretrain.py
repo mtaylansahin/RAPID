@@ -191,6 +191,154 @@ def train_global_model(
                         "num_entities": data_module.num_entities,
                         "num_rels": data_module.num_rels,
                         "hidden_dim": model.hidden_dim,
+                        "seq_len": model.seq_len,
+                        "encoder_type": getattr(model, "encoder_type", "gru"),
+                    },
+                },
+                output_path,
+            )
+
+    print(f"\nPretraining complete! Best loss: {best_loss:.4f}")
+    print(f"Model saved to: {output_path}")
+
+
+def sample_negative_edges(
+    num_entities: int,
+    pos_edges: set,
+    num_negatives: int,
+) -> torch.Tensor:
+    """Sample random negative edges that don't exist in pos_edges."""
+    neg_edges = []
+    while len(neg_edges) < num_negatives:
+        e1 = np.random.randint(0, num_entities)
+        e2 = np.random.randint(0, num_entities)
+        if e1 != e2 and (e1, e2) not in pos_edges and (e2, e1) not in pos_edges:
+            neg_edges.append((e1, e2))
+    return torch.LongTensor(neg_edges)
+
+
+def train_global_model_edges(
+    model: torch.nn.Module,
+    data_module: PPIDataModule,
+    device: torch.device,
+    epochs: int = 30,
+    lr: float = 1e-3,
+    output_path: Optional[Path] = None,
+    neg_ratio: float = 1.0,
+    weight_decay: float = 1e-5,
+    grad_norm: float = 1.0,
+):
+    """
+    Train global model with graph reconstruction (edge prediction) task.
+
+    For each timestep t, predicts which edges exist using the global embedding
+    computed from history < t.
+
+    Args:
+        model: Global model to train
+        data_module: Data module with training data
+        device: Torch device
+        epochs: Number of training epochs
+        lr: Learning rate
+        output_path: Path to save model checkpoint
+        neg_ratio: Ratio of negative to positive edges
+        weight_decay: L2 regularization
+        grad_norm: Gradient clipping norm
+    """
+    print(f"\nEntities: {data_module.num_entities}")
+    print(f"Relations: {data_module.num_rels}")
+    print(f"Train timesteps: {len(data_module.train_times)}")
+    print("Pretraining mode: Edge Prediction (Graph Reconstruction)")
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+
+    # Build edges per timestep
+    timesteps = sorted(data_module.train_times)
+    edges_by_t: Dict[int, set] = {t: set() for t in timesteps}
+
+    for row in data_module.train_data:
+        e1, _, e2, t = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        if t in edges_by_t:
+            edges_by_t[t].add((min(e1, e2), max(e1, e2)))
+
+    if output_path is None:
+        output_path = Path(f"./models/{data_module.dataset}/global_edges.pth")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    best_loss = float("inf")
+
+    print("\nStarting edge prediction training...")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0
+        n_batches = 0
+        t0 = time.time()
+
+        # Shuffle timesteps
+        shuffled_times = list(timesteps[1:])  # Skip first (no history)
+        np.random.shuffle(shuffled_times)
+
+        pbar = tqdm(shuffled_times, desc=f"Epoch {epoch:03d}")
+
+        for t in pbar:
+            pos_edges = list(edges_by_t[t])
+            if len(pos_edges) < 2:
+                continue
+
+            pos_edges_tensor = torch.LongTensor(pos_edges).to(device)
+
+            # Sample negative edges
+            num_neg = int(len(pos_edges) * neg_ratio)
+            neg_edges_tensor = sample_negative_edges(
+                data_module.num_entities,
+                edges_by_t[t],
+                num_neg,
+            ).to(device)
+
+            # Forward pass
+            loss = model.edge_prediction_forward(
+                t, pos_edges_tensor, neg_edges_tensor, data_module.graph_dict
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        # Compute global embeddings
+        model.eval()
+        with torch.no_grad():
+            global_emb = model.compute_global_embeddings(
+                timesteps, data_module.graph_dict
+            )
+
+        elapsed = time.time() - t0
+        avg_loss = epoch_loss / max(n_batches, 1)
+
+        print(f"Epoch {epoch:03d} | Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            print(f"  -> New best! Saving to {output_path}")
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "global_emb": {k: v.cpu() for k, v in global_emb.items()},
+                    "config": {
+                        "num_entities": data_module.num_entities,
+                        "num_rels": data_module.num_rels,
+                        "hidden_dim": model.hidden_dim,
+                        "seq_len": model.seq_len,
+                        "encoder_type": getattr(model, "encoder_type", "gru"),
+                        "pretrain_mode": "edges",
                     },
                 },
                 output_path,

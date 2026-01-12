@@ -15,8 +15,8 @@ import torch
 import torch.nn as nn
 
 from src.config import ModelConfig
-from src.models.classifier import SymmetricEdgeClassifier
-from src.models.encoder import TemporalEncoder
+from src.models.classifier import SymmetricEdgeClassifier, SymmetricTransitionClassifier
+from src.models.encoder import TemporalEncoder, AttentionTemporalEncoder
 from src.models.rgcn import UndirectedRGCN, build_undirected_graph
 
 
@@ -76,21 +76,47 @@ class RAPIDModel(nn.Module):
             dropout=config.dropout,
         )
 
-        # Input dim: entity_embed + neighbor_embed + rel_embed + global_embed
-        self.temporal_encoder = TemporalEncoder(
-            input_dim=4 * config.hidden_dim,
-            hidden_dim=config.hidden_dim,
-            num_layers=1,
-            dropout=config.dropout,
+        # Temporal encoder (GRU or Attention)
+        self.use_attention_encoder = getattr(config, "use_attention_encoder", False)
+
+        if self.use_attention_encoder:
+            self.temporal_encoder = AttentionTemporalEncoder(
+                input_dim=4 * config.hidden_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=2,
+                num_heads=4,
+                dropout=config.dropout,
+                max_seq_len=config.seq_len + 5,
+            )
+        else:
+            self.temporal_encoder = TemporalEncoder(
+                input_dim=4 * config.hidden_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=1,
+                dropout=config.dropout,
+            )
+
+        # Store transition prediction mode
+        self.use_transition_prediction = getattr(
+            config, "use_transition_prediction", False
         )
 
-        self.classifier = SymmetricEdgeClassifier(
-            hidden_dim=config.hidden_dim,
-            classifier_hidden_dim=config.classifier_hidden_dim,
-            dropout=config.classifier_dropout,
-            scoring_fn="concat",
-            use_temporal=True,
-        )
+        # Create appropriate classifier based on mode
+        if self.use_transition_prediction:
+            self.classifier = SymmetricTransitionClassifier(
+                hidden_dim=config.hidden_dim,
+                classifier_hidden_dim=config.classifier_hidden_dim,
+                dropout=config.classifier_dropout,
+                use_temporal=True,
+            )
+        else:
+            self.classifier = SymmetricEdgeClassifier(
+                hidden_dim=config.hidden_dim,
+                classifier_hidden_dim=config.classifier_hidden_dim,
+                dropout=config.classifier_dropout,
+                scoring_fn="concat",
+                use_temporal=True,
+            )
 
         self.dropout = nn.Dropout(config.dropout)
         self._dgl_has_cuda = self._check_dgl_cuda_support()
@@ -312,6 +338,7 @@ class RAPIDModel(nn.Module):
         entity2_history_t: List[List[int]],
         graph_dict: Dict[int, dgl.DGLGraph],
         global_emb: Optional[Dict[int, torch.Tensor]] = None,
+        was_on_t_minus_1: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for training.
@@ -327,9 +354,14 @@ class RAPIDModel(nn.Module):
             entity2_history_t: Timestamps for entity2 history
             graph_dict: Graphs per timestep
             global_emb: Global embeddings per timestep
+            was_on_t_minus_1: For transition prediction mode, whether each pair
+                was ON at t-1. Not used during training (model learns from temporal
+                patterns), but kept for API compatibility.
 
         Returns:
             Logits of shape (batch_size,)
+            - If use_transition_prediction: returns P(transition) logits
+            - Otherwise: returns P(edge) logits
         """
         # Clear RGCN cache for this forward pass
         self._rgcn_cache = {}
@@ -359,7 +391,7 @@ class RAPIDModel(nn.Module):
         entity1_temporal = self.dropout(entity1_temporal)
         entity2_temporal = self.dropout(entity2_temporal)
 
-        # Classify
+        # Classify - both modes now use same forward signature (no was_on input)
         logits = self.classifier(
             entity1_embed,
             entity2_embed,
@@ -635,12 +667,45 @@ class RAPIDModel(nn.Module):
                     entity2_ids[i].item()
                 )
 
-            logits = self.classifier(
-                entity1_embed,
-                entity2_embed,
-                entity1_temporal,
-                entity2_temporal,
-            )
+            # Handle transition prediction mode
+            if self.use_transition_prediction:
+                # Compute was_on_t_minus_1 from prediction cache (autoregressive)
+                was_on_list = []
+                for i in range(batch_size):
+                    e1, e2 = entity1_ids[i].item(), entity2_ids[i].item()
+                    edge = self._canonical_edge(e1, e2)
+                    # Check if this edge was predicted ON at the previous timestep
+                    was_on = edge in self._prediction_cache.get(
+                        self._latest_time - 1, set()
+                    )
+                    # Also check if it exists in historical graphs
+                    if not was_on and (self._latest_time - 1) in self._graph_dict:
+                        prev_g = self._graph_dict[self._latest_time - 1]
+                        if hasattr(prev_g, "edges"):
+                            src, dst = prev_g.edges()
+                            for s, d in zip(src.tolist(), dst.tolist()):
+                                if self._canonical_edge(s, d) == edge:
+                                    was_on = True
+                                    break
+                    was_on_list.append(was_on)
+
+                was_on_t_minus_1 = torch.BoolTensor(was_on_list).to(device)
+
+                logits = self.classifier.get_edge_logits(
+                    entity1_embed,
+                    entity2_embed,
+                    was_on_t_minus_1,
+                    entity1_temporal,
+                    entity2_temporal,
+                )
+            else:
+                logits = self.classifier(
+                    entity1_embed,
+                    entity2_embed,
+                    entity1_temporal,
+                    entity2_temporal,
+                )
+
             probs = torch.sigmoid(logits)
             preds = (probs >= threshold).long()
 

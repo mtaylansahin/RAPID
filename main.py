@@ -44,7 +44,7 @@ from src.evaluate import Evaluator
 from src.analysis import AnalysisConfig, ResultsManager
 from src.models.global_model import create_global_model
 from src.models.rapid import create_model
-from src.pretrain import train_global_model
+from src.pretrain import train_global_model, train_global_model_edges
 from src.train import Trainer
 
 # Constants
@@ -111,6 +111,8 @@ def load_global_model(
     checkpoint = torch.load(path, map_location=device)
 
     gm_config = checkpoint.get("config", {})
+    encoder_type = gm_config.get("encoder_type", "gru")
+    print(f"  Encoder type: {encoder_type}")
 
     model = create_global_model(
         num_entities=num_entities,
@@ -119,6 +121,7 @@ def load_global_model(
         num_bases=gm_config.get("num_bases", 5),
         seq_len=gm_config.get("seq_len", default_seq_len),
         pooling=gm_config.get("pooling", "max"),
+        encoder_type=encoder_type,
     )
 
     model.load_state_dict(checkpoint["state_dict"])
@@ -148,7 +151,8 @@ def run_pretrain(args) -> Path:
     )
 
     # Create global model
-    print("\nCreating global RGCN model...")
+    encoder_type = getattr(args, "global_encoder_type", "gru")
+    print(f"\nCreating global model (encoder: {encoder_type})...")
     model = create_global_model(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
@@ -156,6 +160,7 @@ def run_pretrain(args) -> Path:
         num_bases=args.num_bases,
         seq_len=args.seq_len,
         pooling=args.pooling,
+        encoder_type=encoder_type,
     )
     model = model.to(device)
 
@@ -166,14 +171,27 @@ def run_pretrain(args) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{args.pooling}_global.pth"
 
-    train_global_model(
-        model=model,
-        data_module=data_module,
-        device=device,
-        epochs=args.pretrain_epochs,
-        lr=args.pretrain_lr,
-        output_path=output_path,
-    )
+    # Train based on mode
+    pretrain_mode = getattr(args, "pretrain_mode", "entity")
+
+    if pretrain_mode == "edges":
+        train_global_model_edges(
+            model=model,
+            data_module=data_module,
+            device=device,
+            epochs=args.pretrain_epochs,
+            lr=args.pretrain_lr,
+            output_path=output_path,
+        )
+    else:
+        train_global_model(
+            model=model,
+            data_module=data_module,
+            device=device,
+            epochs=args.pretrain_epochs,
+            lr=args.pretrain_lr,
+            output_path=output_path,
+        )
 
     return output_path
 
@@ -191,6 +209,8 @@ def run_train(args) -> Path:
         hidden_dim=args.hidden_dim,
         seq_len=args.seq_len,
         dropout=args.dropout,
+        use_transition_prediction=getattr(args, "use_transition_prediction", False),
+        use_attention_encoder=getattr(args, "use_attention_encoder", False),
     )
 
     training_config = TrainingConfig(
@@ -372,7 +392,7 @@ def run_evaluate(args) -> bool:
         config=model_config,
         node_features=node_features,
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
     # Get threshold (from checkpoint)
     threshold = checkpoint.get("optimal_threshold", 0.5)
@@ -462,6 +482,20 @@ def main():
         choices=["max", "mean"],
         help="Graph pooling method",
     )
+    pretrain_parser.add_argument(
+        "--global_encoder_type",
+        type=str,
+        default="gru",
+        choices=["gru", "transformer"],
+        help="Global model encoder type (gru or transformer)",
+    )
+    pretrain_parser.add_argument(
+        "--pretrain_mode",
+        type=str,
+        default="entity",
+        choices=["entity", "edges"],
+        help="Pretraining mode: entity distribution or edge prediction",
+    )
 
     # === Train command ===
     train_parser = subparsers.add_parser(
@@ -519,6 +553,16 @@ def main():
         "--no_intrachain_features",
         action="store_true",
         help="Disable intrachain features (only use physicochemical)",
+    )
+    train_parser.add_argument(
+        "--use_transition_prediction",
+        action="store_true",
+        help="Train to predict state transitions instead of absolute states",
+    )
+    train_parser.add_argument(
+        "--use_attention_encoder",
+        action="store_true",
+        help="Use attention-based temporal encoder instead of GRU",
     )
 
     # === Evaluate command ===
@@ -586,6 +630,20 @@ def main():
         choices=["max", "mean"],
         help="Graph pooling method",
     )
+    all_parser.add_argument(
+        "--global_encoder_type",
+        type=str,
+        default="gru",
+        choices=["gru", "transformer"],
+        help="Global model encoder type (gru or transformer)",
+    )
+    all_parser.add_argument(
+        "--pretrain_mode",
+        type=str,
+        default="entity",
+        choices=["entity", "edges"],
+        help="Pretraining mode: entity distribution or edge prediction",
+    )
     # Train args
     all_parser.add_argument(
         "--epochs", type=int, default=100, help="Maximum training epochs"
@@ -650,6 +708,16 @@ def main():
         "--no_intrachain_features",
         action="store_true",
         help="Disable intrachain features (only use physicochemical)",
+    )
+    all_parser.add_argument(
+        "--use_transition_prediction",
+        action="store_true",
+        help="Train to predict state transitions instead of absolute states",
+    )
+    all_parser.add_argument(
+        "--use_attention_encoder",
+        action="store_true",
+        help="Use attention-based temporal encoder instead of GRU",
     )
 
     # === Preprocess command ===

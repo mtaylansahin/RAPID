@@ -99,6 +99,9 @@ class Trainer:
 
         dataloader = self.data_module.get_train_dataloader()
 
+        # Check if we're using transition prediction mode
+        use_transition = getattr(self.model.config, "use_transition_prediction", False)
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch:03d} [Train]")
 
         for batch in pbar:
@@ -116,7 +119,45 @@ class Trainer:
                 graph_dict=self.data_module.graph_dict,
                 global_emb=self.global_emb,
             )
-            loss = self.criterion(logits, labels)
+
+            # Compute loss based on mode
+            if use_transition:
+                # DUAL-TASK LEARNING: combine edge loss + transition loss
+                # This encourages persistence-based predictions with selective transitions
+
+                transition_labels = batch["is_transition"].to(self.device)
+                was_on = batch["was_on_t_minus_1"].to(self.device).float()
+
+                # 1. Transition loss: predict when state changes
+                # Moderate upweighting for transitions (lower than before for precision)
+                transition_weight = 5.0
+                trans_weights = torch.where(
+                    transition_labels > 0.5,
+                    torch.full_like(transition_labels, transition_weight),
+                    torch.ones_like(transition_labels),
+                )
+                trans_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, transition_labels, reduction="none"
+                )
+                trans_loss = (trans_loss * trans_weights).mean()
+
+                # 2. Edge loss: convert transition logits to edge logits, compare to edge labels
+                # This encourages accurate edge predictions (favors persistence)
+                edge_logits = logits * (1 - 2 * was_on)  # XOR in logit space
+                edge_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    edge_logits, labels, reduction="mean"
+                )
+
+                # Combined loss: balance edge accuracy with transition detection
+                # Higher alpha = more focus on edge accuracy (persistence)
+                alpha = 0.4  # 40% edge loss, 60% transition loss
+                loss = alpha * edge_loss + (1 - alpha) * trans_loss
+
+                self.train_metrics.update(edge_logits, labels, loss.item())
+            else:
+                # Standard mode: model outputs P(edge) logits
+                loss = self.criterion(logits, labels)
+                self.train_metrics.update(logits, labels, loss.item())
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -128,7 +169,6 @@ class Trainer:
                 )
 
             self.optimizer.step()
-            self.train_metrics.update(logits, labels, loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         return self.train_metrics.compute()
@@ -312,6 +352,12 @@ class Trainer:
                 "model": {
                     "hidden_dim": self.model.hidden_dim,
                     "seq_len": self.model.seq_len,
+                    "use_transition_prediction": getattr(
+                        self.model, "use_transition_prediction", False
+                    ),
+                    "use_attention_encoder": getattr(
+                        self.model, "use_attention_encoder", False
+                    ),
                 },
                 "node_features": {
                     "enabled": self.model.use_node_features,

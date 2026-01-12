@@ -212,6 +212,20 @@ class PPIDataModule:
         self.graph_dict = self._build_graph_dict()
         self.entity_history, self.entity_history_t = self._build_histories()
 
+        # Build edges_at_t for computing was_on_t_minus_1
+        self.edges_at_t = self._build_edges_at_t()
+
+    def _build_edges_at_t(self) -> Dict[int, Set[Tuple[int, int]]]:
+        """Build set of active edges at each timestep for transition features."""
+        edges_at_t: Dict[int, Set[Tuple[int, int]]] = {}
+        for e1, rel, e2, t in self.train_dataset.data:
+            # Canonicalize edge
+            pair = (min(e1, e2), max(e1, e2))
+            if t not in edges_at_t:
+                edges_at_t[t] = set()
+            edges_at_t[t].add(pair)
+        return edges_at_t
+
     def _build_graph_dict(self) -> Dict[int, dgl.DGLGraph]:
         """Build DGL graphs for each timestep from training data."""
         graph_dict = {}
@@ -449,6 +463,16 @@ class PPIDataModule:
         entity2_history = []
         entity2_history_t = []
 
+        # Compute was_on_t_minus_1 for transition prediction
+        was_on_t_minus_1_list = []
+
+        # Get sorted timesteps to find t-1
+        all_timesteps = sorted(self.edges_at_t.keys())
+        t_to_prev = {}  # Map each timestep to its predecessor
+        for i, t in enumerate(all_timesteps):
+            if i > 0:
+                t_to_prev[t] = all_timesteps[i - 1]
+
         for b in batch:
             e1, e2, t = b["entity1"], b["entity2"], b["timestep"]
 
@@ -472,6 +496,20 @@ class PPIDataModule:
             entity2_history.append(e2_hist)
             entity2_history_t.append(e2_hist_t)
 
+            # Compute was_on_t_minus_1
+            pair = (min(e1, e2), max(e1, e2))
+            t_prev = t_to_prev.get(t)
+            if t_prev is not None and t_prev in self.edges_at_t:
+                was_on = pair in self.edges_at_t[t_prev]
+            else:
+                was_on = False
+            was_on_t_minus_1_list.append(was_on)
+
+        was_on_t_minus_1 = torch.BoolTensor(was_on_t_minus_1_list)
+
+        # Compute transition labels (label != was_on_t_minus_1)
+        is_transition = (labels > 0.5) != was_on_t_minus_1
+
         return {
             "entity1": entity1,
             "entity2": entity2,
@@ -481,4 +519,6 @@ class PPIDataModule:
             "entity1_history_t": entity1_history_t,
             "entity2_history": entity2_history,
             "entity2_history_t": entity2_history_t,
+            "was_on_t_minus_1": was_on_t_minus_1,
+            "is_transition": is_transition.float(),
         }

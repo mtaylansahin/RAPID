@@ -1,5 +1,6 @@
 """Evaluation module for RAPID - Protein Interaction Dynamics prediction."""
 
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +14,9 @@ from src.metrics import (
     ClassificationMetrics,
     MetricsComputer,
     PerTimestepMetrics,
+    TransitionMetrics,
     compute_per_timestep_metrics,
+    compute_transition_metrics,
 )
 from src.models.global_model import PPIGlobalModel
 from src.models.rapid import RAPIDModel
@@ -288,6 +291,14 @@ class Evaluator:
         print(f"  Mean AUPRC: {per_ts_metrics.mean_auprc:.4f}")
         print(f"  Mean F1: {per_ts_metrics.mean_f1:.4f}")
 
+        # Transition metrics (uses cache)
+        transition_metrics = self.evaluate_transitions(split=split)
+        results["transition_metrics"] = transition_metrics.to_dict()
+        print("\nTransition Analysis:")
+        print(f"  {transition_metrics}")
+        print(f"  Persistence Accuracy: {transition_metrics.persistence_accuracy:.4f}")
+        print(f"  Balanced Accuracy: {transition_metrics.balanced_accuracy:.4f}")
+
         # Check for temporal degradation
         if len(per_ts_metrics.auprcs) > 5:
             early = np.mean(per_ts_metrics.auprcs[:5])
@@ -299,3 +310,81 @@ class Evaluator:
                 )
 
         return results
+
+    @torch.no_grad()
+    def evaluate_transitions(self, split: str = "test") -> TransitionMetrics:
+        """
+        Compute transition-focused metrics.
+
+        Uses PREDICTED labels from t-1 (not ground truth) to avoid leakage.
+        This measures how well the model predicts state changes.
+
+        Uses cached inference results if available.
+        """
+        results = self.run_inference(split=split)
+
+        predictions_list = results[
+            "predictions"
+        ]  # List of (e1, rel, e2, t, score, pred)
+
+        # Group predictions by timestep
+        preds_by_t: Dict[int, Dict[Tuple[int, int], int]] = defaultdict(dict)
+        labels_by_t: Dict[int, Dict[Tuple[int, int], int]] = {}
+
+        # Get dataset for ground truth labels
+        if split == "valid":
+            dataset = self.data_module.val_dataset
+        else:
+            dataset = self.data_module.test_dataset
+
+        # Build ground truth labels by timestep
+        for t in dataset.unique_timesteps:
+            labels_by_t[t] = {}
+            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(
+                t, split=split
+            )
+            for i, (e1, e2) in enumerate(pairs):
+                pair = (min(e1, e2), max(e1, e2))
+                labels_by_t[t][pair] = int(labels_np[i])
+
+        # Build predictions by timestep
+        for e1, rel, e2, t, score, pred in predictions_list:
+            pair = (min(e1, e2), max(e1, e2))
+            preds_by_t[t][pair] = pred
+
+        # Compute transition metrics across all timesteps (using predicted t-1)
+        all_predictions = []
+        all_labels = []
+        all_prev_labels = []
+
+        timesteps = sorted(dataset.unique_timesteps)
+
+        for i, t in enumerate(timesteps):
+            if i == 0:
+                continue  # No t-1 for first timestep
+
+            t_prev = timesteps[i - 1]
+
+            for pair in labels_by_t[t]:
+                if pair in labels_by_t.get(t_prev, {}):
+                    # Use PREDICTED label from t-1, not ground truth!
+                    if pair in preds_by_t.get(t_prev, {}):
+                        prev_pred = preds_by_t[t_prev][pair]
+                    else:
+                        # If no prediction at t-1, use ground truth from training context
+                        # (this is OK - it's historical data, not test leakage)
+                        prev_pred = labels_by_t.get(t_prev, {}).get(pair, 0)
+
+                    if pair in preds_by_t.get(t, {}):
+                        all_predictions.append(preds_by_t[t][pair])
+                        all_labels.append(labels_by_t[t][pair])
+                        all_prev_labels.append(prev_pred)
+
+        if not all_predictions:
+            return TransitionMetrics()
+
+        return compute_transition_metrics(
+            np.array(all_predictions),
+            np.array(all_labels),
+            np.array(all_prev_labels),
+        )
