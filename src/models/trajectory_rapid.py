@@ -477,10 +477,15 @@ class TrajectoryRAPIDModel(nn.Module):
             # Check cache
             if t not in self._rgcn_cache:
                 g = graph_dict[t]
-                node_ids = g.ndata.get("id", torch.arange(g.num_nodes()))
+                # Move graph to device if needed
+                if g.device != device:
+                    g = g.to(device)
+                node_ids = g.ndata.get("id", torch.arange(g.num_nodes(), device=device))
+                if node_ids.device != device:
+                    node_ids = node_ids.to(device)
                 node_features = self.entity_embeds[node_ids]
                 updated = self.rgcn(g, node_features)
-                self._rgcn_cache[t] = (node_ids, updated)
+                self._rgcn_cache[t] = (node_ids.to(device), updated.to(device))
 
             node_ids, updated = self._rgcn_cache[t]
 

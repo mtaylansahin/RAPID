@@ -406,3 +406,9 @@ class TrajectoryDataModule:
         """Return (start, end) indices of test timesteps in target."""
         start = len(self.val_timesteps)
         return (start, start + len(self.test_timesteps))
+
+    def to(self, device: torch.device) -> "TrajectoryDataModule":
+        """Move graphs to specified device for GPU training."""
+        for t in self.graph_dict:
+            self.graph_dict[t] = self.graph_dict[t].to(device)
+        return self

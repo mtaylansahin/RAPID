@@ -235,6 +235,11 @@ class UndirectedRGCN(nn.Module):
         Returns:
             Updated node features of shape (num_nodes, hidden_dim)
         """
+        # Ensure graph is on the same device as node features
+        device = node_features.device
+        if g.device != device:
+            g = g.to(device)
+
         g.ndata["h"] = node_features
 
         for layer in self.layers:

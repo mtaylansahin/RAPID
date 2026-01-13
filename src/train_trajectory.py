@@ -188,6 +188,10 @@ class TrajectoryTrainer:
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
 
+        # Move graphs to device for GPU training
+        if device.type == "cuda":
+            self.data_module.to(device)
+
         self.checkpoint_dir = Path(checkpoint_dir)
         self.log_dir = Path(log_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
