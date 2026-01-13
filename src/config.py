@@ -74,3 +74,56 @@ class TrainingConfig:
 
     # Logging
     eval_interval: int = 1  # Evaluate every N epochs
+
+
+@dataclass
+class TrajectoryModelConfig:
+    """Configuration for TrajectoryRAPID model."""
+
+    # Dimensions
+    hidden_dim: int = 128
+    n_heads: int = 4
+    n_encoder_layers: int = 2
+    n_decoder_layers: int = 2
+    n_neighbor_layers: int = 1
+
+    # Limits
+    max_neighbors: int = 50
+    max_seq_len: int = 200
+
+    # Regularization
+    dropout: float = 0.1
+
+    # Feature flags for ablation
+    use_rgcn: bool = True
+    use_global_context: bool = True
+    use_neighbor_attention: bool = True
+    use_node_features: bool = False
+
+    # RGCN settings
+    num_rgcn_layers: int = 2
+    num_bases: int = 100
+
+
+@dataclass
+class TrajectoryTrainingConfig:
+    """Configuration for trajectory-level training."""
+
+    # Optimization
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-5
+
+    # Training schedule
+    max_epochs: int = 50
+    patience: int = 10
+    batch_size: int = 64
+
+    # Loss
+    transition_weight: float = 1.0  # Weight for transition timesteps
+    use_focal_loss: bool = False
+    focal_gamma: float = 2.0
+
+    # Data
+    history_ratio: float = 0.5  # Fraction of timesteps for history
+    val_ratio: float = 0.2  # Fraction of prediction timesteps for val
+    n_hops: int = 1  # Neighbor expansion hops
