@@ -2,57 +2,64 @@
 """
 RAPID: A Recurrent Architecture for Predicting Protein Interaction Dynamics
 
-This script orchestrates all functionality:
+Unified pipeline supporting:
+- preprocess: Convert raw MD simulation data to RAPID format
 - pretrain: Train the global RGCN model
-- train: Train the main RAPID model
+- train: Train the TrajectoryRAPID model (hybrid RGCN + Transformer)
 - evaluate: Evaluate a trained model
-- all: Run full pipeline (pretrain -> train -> evaluate)
+- all: Run full pipeline (preprocess -> pretrain -> train -> evaluate)
+
+The architecture uses TrajectoryRAPID - a hybrid model combining:
+- RGCN for structure-aware entity embeddings
+- Transformer encoder for edge history
+- Cross-attention to neighbor edges
+- Transformer decoder for full trajectory prediction
 
 Examples:
     # Full pipeline
-    uv run python main.py all --dataset RAPID --epochs 100
+    uv run python main.py all --dataset 1JPS --epochs 50
 
     # Pretrain global model only
-    uv run python main.py pretrain --dataset RAPID --epochs 30
+    uv run python main.py pretrain --dataset 1JPS --epochs 30
 
-    # Train with global model
-    uv run python main.py train --dataset RAPID --use_global_model --epochs 100
+    # Train with all features
+    uv run python main.py train --dataset 1JPS --epochs 50
 
-    # Train without global model
-    uv run python main.py train --dataset RAPID --epochs 100
+    # Ablation: disable RGCN
+    uv run python main.py train --dataset 1JPS --no_rgcn
 
     # Evaluate
-    uv run python main.py evaluate --checkpoint ./checkpoints/RAPID_*/best.pth
+    uv run python main.py evaluate --checkpoint ./checkpoints/1JPS_*/best.pth
 """
 
 import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 # Internal imports
-from src.config import ModelConfig, NodeFeatureConfig, TrainingConfig
-from src.data.dataset import PPIDataModule
+from src.config import TrajectoryModelConfig, TrajectoryTrainingConfig
+from src.data.trajectory_dataset import TrajectoryDataModule
+from src.data.dataset import PPIDataModule  # Still needed for pretrain
 from src.data.preprocessing import PreprocessingConfig, run_preprocessing
-from src.data.node_features import compute_node_features
-from src.evaluate import Evaluator
-from src.analysis import AnalysisConfig, ResultsManager
+from src.models.trajectory_rapid import TrajectoryRAPIDModel
 from src.models.global_model import create_global_model
-from src.models.rapid import create_model
 from src.pretrain import train_global_model
-from src.train import Trainer
+from src.train_trajectory import TrajectoryTrainer
 
 # Constants
-DATA_DIR = Path("./data")
+DATA_DIR = Path("./data/processed")
+RAW_DATA_DIR = Path("./data/raw")
 MODELS_DIR = Path("./models")
 CHECKPOINTS_DIR = Path("./checkpoints")
 LOGS_DIR = Path("./logs")
 PREDICTIONS_DIR = Path("./predictions")
+ANALYSIS_DIR = Path("./analysis_outputs")
 
 
 def get_base_args():
@@ -61,14 +68,10 @@ def get_base_args():
 
     # Common arguments
     parser.add_argument(
-        "--dataset", type=str, default="RAPID", help="Dataset name (folder in data/)"
+        "--dataset", type=str, default="1JPS", help="Dataset name (folder in data/processed/)"
     )
-    parser.add_argument("--hidden_dim", type=int, default=200, help="Hidden dimension")
-    parser.add_argument(
-        "--seq_len", type=int, default=10, help="History sequence length"
-    )
-    parser.add_argument("--num_bases", type=int, default=5, help="Number of RGCN bases")
-    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--gpu", type=int, default=-1, help="GPU device (-1 for CPU)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
@@ -98,9 +101,8 @@ def load_global_model(
     num_entities: int,
     num_rels: int,
     device: torch.device,
-    default_hidden_dim: int = 200,
-    default_seq_len: int = 10,
-) -> nn.Module:
+    hidden_dim: int = 128,
+) -> Optional[nn.Module]:
     """Load a pretrained global RGCN model from checkpoint."""
     path = Path(path)
     if not path.exists():
@@ -115,9 +117,9 @@ def load_global_model(
     model = create_global_model(
         num_entities=num_entities,
         num_rels=num_rels,
-        hidden_dim=gm_config.get("hidden_dim", default_hidden_dim),
+        hidden_dim=gm_config.get("hidden_dim", hidden_dim),
         num_bases=gm_config.get("num_bases", 5),
-        seq_len=gm_config.get("seq_len", default_seq_len),
+        seq_len=gm_config.get("seq_len", 10),
         pooling=gm_config.get("pooling", "max"),
     )
 
@@ -132,12 +134,12 @@ def load_global_model(
 def run_pretrain(args) -> Path:
     """Run global model pretraining."""
     print("\n" + "=" * 60)
-    print("Stage 1: Pretraining Global Model")
+    print("Stage: Pretraining Global Model")
     print("=" * 60)
 
     device = setup_env(args)
 
-    # Load data
+    # Load data using PPIDataModule (for pretraining compatibility)
     data_path = DATA_DIR / args.dataset
     print(f"\nLoading dataset: {args.dataset}")
     data_module = PPIDataModule(
@@ -154,7 +156,7 @@ def run_pretrain(args) -> Path:
         num_rels=data_module.num_rels,
         hidden_dim=args.hidden_dim,
         num_bases=args.num_bases,
-        seq_len=args.seq_len,
+        seq_len=10,
         pooling=args.pooling,
     )
     model = model.to(device)
@@ -179,123 +181,92 @@ def run_pretrain(args) -> Path:
 
 
 def run_train(args) -> Path:
-    """Run main model training."""
+    """Run TrajectoryRAPID training."""
     print("\n" + "=" * 60)
-    print("Stage 2: Training Main Model")
+    print("Stage: Training TrajectoryRAPID Model")
     print("=" * 60)
 
     device = setup_env(args)
-
-    # Create configs
-    model_config = ModelConfig(
-        hidden_dim=args.hidden_dim,
-        seq_len=args.seq_len,
-        dropout=args.dropout,
-    )
-
-    training_config = TrainingConfig(
-        learning_rate=args.lr,
-        max_epochs=args.epochs,
-        patience=args.patience,
-        focal_gamma=args.focal_gamma,
-    )
 
     # Setup paths
     checkpoint_dir = CHECKPOINTS_DIR / args.experiment_name
     log_dir = LOGS_DIR / args.experiment_name
 
     # Load data
+    data_path = DATA_DIR / args.dataset
     print(f"\nLoading dataset: {args.dataset}")
-    data_module = PPIDataModule(
-        data_path=DATA_DIR / args.dataset,
-        batch_size=args.batch_size,
-        neg_ratio=args.neg_ratio,
-        hard_ratio=args.hard_ratio,
-        seed=args.seed,
-    )
 
-    # Compute node features if enabled
-    node_features = None
-    if not getattr(args, "no_node_features", False):
-        print("\nComputing node features...")
-        node_feature_config = NodeFeatureConfig(
-            enabled=True,
-            use_physicochemical=not getattr(args, "no_physicochemical", False),
-            use_intrachain=not getattr(args, "no_intrachain_features", False),
-        )
-        # Get train cutoff for data leakage prevention
-        train_cutoff = data_module.train_max_time
-        node_features = compute_node_features(
-            config=node_feature_config,
-            data_dir=DATA_DIR / args.dataset,
-            train_cutoff=train_cutoff,
-        )
-        if node_features is not None:
-            print(f"  Node features shape: {node_features.shape}")
-        model_config.node_features = node_feature_config
-    else:
-        print("\nNode features disabled.")
-        model_config.node_features = NodeFeatureConfig(enabled=False)
+    data_module = TrajectoryDataModule(
+        data_path=data_path,
+        history_ratio=args.history_ratio,
+        val_ratio=args.val_ratio,
+        max_neighbors=args.max_neighbors,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        n_hops=args.n_hops,
+    )
 
     # Create model
-    print("\nCreating model...")
-    model = create_model(
+    print("\nCreating TrajectoryRAPID model...")
+    print(f"  RGCN: {not args.no_rgcn}")
+    print(f"  Global context: {not args.no_global}")
+    print(f"  Neighbor attention: {not args.no_neighbors}")
+    print(f"  N-hops: {args.n_hops}")
+
+    model = TrajectoryRAPIDModel(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
-        config=model_config,
-        node_features=node_features,
+        hidden_dim=args.hidden_dim,
+        n_heads=args.n_heads,
+        n_encoder_layers=args.n_encoder_layers,
+        n_decoder_layers=args.n_decoder_layers,
+        n_neighbor_layers=args.n_neighbor_layers,
+        max_neighbors=args.max_neighbors,
+        max_seq_len=data_module.hist_len + data_module.traj_len + 10,
+        dropout=args.dropout,
+        use_rgcn=not args.no_rgcn,
+        use_global_context=not args.no_global,
+        use_neighbor_attention=not args.no_neighbors,
+        use_node_features=args.use_node_features,
+        num_rgcn_layers=args.num_rgcn_layers,
+        num_bases=args.num_bases,
     )
 
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Load global model if specified
-    global_model = None
-    if args.use_global_model:
-        if args.global_model_path:
-            global_model_path = Path(args.global_model_path)
-        else:
-            global_model_path = MODELS_DIR / args.dataset / "max_global.pth"
-
-        global_model = load_global_model(
-            path=global_model_path,
-            num_entities=data_module.num_entities,
-            num_rels=data_module.num_rels,
-            device=device,
-            default_hidden_dim=args.hidden_dim,
-            default_seq_len=args.seq_len,
-        )
-        if global_model is None:
-            print("  Training without global model.")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {n_params:,}")
 
     # Create trainer
-    trainer = Trainer(
+    trainer = TrajectoryTrainer(
         model=model,
         data_module=data_module,
-        config=training_config,
-        device=device,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
         checkpoint_dir=checkpoint_dir,
         log_dir=log_dir,
-        global_model=global_model,
+        device=device,
+        transition_weight=args.transition_weight,
+        use_focal_loss=args.focal_loss,
+        focal_gamma=args.focal_gamma,
     )
 
     # Train
-    result = trainer.train()
+    result = trainer.train(n_epochs=args.epochs)
 
     print("\nTraining complete!")
     print(f"  Best epoch: {result['best_epoch']}")
     print(f"  Best AUPRC: {result['best_val_auprc']:.4f}")
-    print(f"  Optimal threshold: {result['optimal_threshold']:.3f}")
 
     return checkpoint_dir / "best.pth"
 
 
-def run_evaluate(args) -> bool:
+def run_evaluate(args) -> Dict:
     """Run evaluation."""
     print("\n" + "=" * 60)
-    print("Stage 3: Evaluation")
+    print("Stage: Evaluation")
     print("=" * 60)
 
-    # Find checkpoint if not specified
+    # Find checkpoint
     checkpoint_path = args.checkpoint
     if not checkpoint_path:
         if CHECKPOINTS_DIR.exists():
@@ -318,122 +289,172 @@ def run_evaluate(args) -> bool:
     # Load data
     data_path = DATA_DIR / args.dataset
     print(f"\nLoading dataset: {args.dataset}")
-    data_module = PPIDataModule(
+
+    data_module = TrajectoryDataModule(
         data_path=data_path,
-        batch_size=128,
-        neg_ratio=1.0,
+        history_ratio=args.history_ratio,
+        val_ratio=args.val_ratio,
+        max_neighbors=args.max_neighbors,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        n_hops=args.n_hops,
     )
 
-    # Load model
+    # Load checkpoint
     print(f"\nLoading model from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    if "config" in checkpoint and "model" in checkpoint["config"]:
-        model_config = ModelConfig(**checkpoint["config"]["model"])
-    else:
-        model_config = ModelConfig()
+    # Get config from checkpoint
+    ckpt_config = checkpoint.get("config", {})
 
-    # Check if model was trained with node features (from checkpoint)
-    node_features_enabled = False
-    use_physicochemical = True
-    use_intrachain = True
-    if "config" in checkpoint and "node_features" in checkpoint["config"]:
-        nf_config = checkpoint["config"]["node_features"]
-        node_features_enabled = nf_config.get("enabled", False)
-        use_physicochemical = nf_config.get("use_physicochemical", True)
-        use_intrachain = nf_config.get("use_intrachain", True)
-
-    # Override model config with checkpoint values
-    model_config.node_features = NodeFeatureConfig(
-        enabled=node_features_enabled,
-        use_physicochemical=use_physicochemical,
-        use_intrachain=use_intrachain,
-    )
-
-    # Compute node features if model was trained with them
-    node_features = None
-    if node_features_enabled:
-        print("\nComputing node features...")
-        print(f"  Physicochemical: {use_physicochemical}, Intrachain: {use_intrachain}")
-        train_cutoff = data_module.train_max_time
-        node_features = compute_node_features(
-            config=model_config.node_features,
-            data_dir=DATA_DIR / args.dataset,
-            train_cutoff=train_cutoff,
-        )
-        if node_features is not None:
-            print(f"  Node features shape: {node_features.shape}")
-    else:
-        print("\nNode features: disabled (model trained without)")
-
-    model = create_model(
+    # Create model with checkpoint config
+    model = TrajectoryRAPIDModel(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
-        config=model_config,
-        node_features=node_features,
+        hidden_dim=ckpt_config.get("hidden_dim", args.hidden_dim),
+        n_heads=args.n_heads,
+        n_encoder_layers=args.n_encoder_layers,
+        n_decoder_layers=args.n_decoder_layers,
+        n_neighbor_layers=args.n_neighbor_layers,
+        max_neighbors=args.max_neighbors,
+        max_seq_len=data_module.hist_len + data_module.traj_len + 10,
+        dropout=args.dropout,
+        use_rgcn=ckpt_config.get("use_rgcn", not args.no_rgcn),
+        use_global_context=ckpt_config.get("use_global_context", not args.no_global),
+        use_neighbor_attention=ckpt_config.get("use_neighbor_attention", not args.no_neighbors),
     )
+
     model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
 
-    # Get threshold (from checkpoint)
-    threshold = checkpoint.get("optimal_threshold", 0.5)
-    print(f"Using threshold: {threshold:.3f}")
+    # Create trainer for evaluation
+    trainer = TrajectoryTrainer(
+        model=model,
+        data_module=data_module,
+        learning_rate=args.lr,
+        device=device,
+        checkpoint_dir=CHECKPOINTS_DIR / "eval_temp",
+        log_dir=LOGS_DIR / "eval_temp",
+    )
 
-    # Load global model if specified
-    global_model = None
-    if args.use_global_model:
-        if args.global_model_path:
-            global_model_path = Path(args.global_model_path)
-        else:
-            global_model_path = MODELS_DIR / args.dataset / "max_global.pth"
+    # Run test evaluation
+    test_metrics = trainer.evaluate_test()
 
-        global_model = load_global_model(
-            path=global_model_path,
-            num_entities=data_module.num_entities,
-            num_rels=data_module.num_rels,
-            device=device,
-            default_hidden_dim=200,  # Default for evaluation if config missing
-            default_seq_len=10,
-        )
-
-    # Create evaluator
-    evaluator = Evaluator(
+    # Save predictions
+    predictions_dir = PREDICTIONS_DIR / args.dataset
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path = predictions_dir / "predictions.txt"
+    _save_trajectory_predictions(
         model=model,
         data_module=data_module,
         device=device,
-        threshold=threshold,
-        global_model=global_model,
+        output_path=predictions_path,
     )
 
-    # Prepare predictions directory for analysis + optional saving
-    predictions_dir = Path(args.predictions_dir) / args.dataset
-    predictions_path = predictions_dir / "predictions.txt"
+    # Run analysis if available
+    try:
+        from src.analysis import AnalysisConfig, ResultsManager
+        
+        analysis_output_dir = ANALYSIS_DIR / Path(checkpoint_path).parent.name
+        analysis_config = AnalysisConfig(
+            input_directory=str(data_path),
+            output_directory=str(analysis_output_dir),
+            output_file_path=str(predictions_path),
+        )
+        results_manager = ResultsManager(analysis_config)
+        if results_manager.run_complete_analysis():
+            print(f"\nAnalysis outputs saved to: {analysis_output_dir}")
+    except Exception as e:
+        print(f"\nWarning: Analysis failed: {e}")
 
-    # Run evaluation
-    evaluator.full_evaluation()
-    evaluator.save_predictions(predictions_path)
+    return test_metrics
 
-    # Run analysis + visualization outputs
-    analysis_output_dir = Path("analysis_outputs") / Path(checkpoint_path).parent.name
-    analysis_config = AnalysisConfig(
-        input_directory=str(data_path),
-        output_directory=str(analysis_output_dir),
-        output_file_path=str(predictions_path),
-    )
-    results_manager = ResultsManager(analysis_config)
-    analysis_success = results_manager.run_complete_analysis()
-    if analysis_success:
-        print(f"\nAnalysis outputs saved to: {analysis_output_dir}")
-    else:
-        print("\nWarning: Analysis pipeline failed. Check logs for details.")
 
-    return True
+def _save_trajectory_predictions(
+    model: TrajectoryRAPIDModel,
+    data_module: TrajectoryDataModule,
+    device: torch.device,
+    output_path: Path,
+    threshold: float = 0.45,  # Selective threshold based on probability distribution
+):
+    """Save trajectory predictions to file.
+    
+    Saves ALL predictions with probabilities for proper analysis,
+    using threshold only for the binary prediction column.
+    """
+    model.eval()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_predictions = []  # Store all predictions with probabilities
+    positive_count = 0
+    dataloader = data_module.get_test_dataloader()
+
+    with torch.no_grad():
+        for batch in dataloader:
+            entity1 = batch["entity1"].to(device)
+            entity2 = batch["entity2"].to(device)
+            history = batch["history"].to(device)
+            history_timesteps = batch["history_timesteps"].to(device)
+            neighbor_e1 = batch["neighbor_entity1"].to(device)
+            neighbor_e2 = batch["neighbor_entity2"].to(device)
+            neighbor_hist = batch["neighbor_history"].to(device)
+            neighbor_mask = batch["neighbor_mask"].to(device)
+            target = batch["target"].to(device)
+
+            traj_len = target.size(1)
+
+            logits = model(
+                entity1_ids=entity1,
+                entity2_ids=entity2,
+                history=history,
+                history_timesteps=history_timesteps,
+                neighbor_entity1=neighbor_e1,
+                neighbor_entity2=neighbor_e2,
+                neighbor_history=neighbor_hist,
+                neighbor_mask=neighbor_mask,
+                traj_len=traj_len,
+                graph_dict=data_module.graph_dict,
+            )
+
+            probs = torch.sigmoid(logits)
+            preds = (probs > threshold).long()
+            ground_truth = target
+
+            # Store ALL predictions with entity IDs, timesteps, probs, and ground truth
+            for b in range(entity1.size(0)):
+                e1, e2 = entity1[b].item(), entity2[b].item()
+                for t_idx in range(traj_len):
+                    actual_t = data_module.hist_len + t_idx
+                    prob = probs[b, t_idx].item()
+                    pred = preds[b, t_idx].item()
+                    gt = ground_truth[b, t_idx].item()
+                    all_predictions.append((e1, e2, actual_t, prob, pred, gt))
+                    if pred == 1:
+                        positive_count += 1
+
+    # Write ALL predictions with probabilities
+    with open(output_path, "w") as f:
+        # Header for clarity
+        f.write("# e1\te2\ttimestep\tprobability\tprediction\tground_truth\n")
+        for e1, e2, t, prob, pred, gt in all_predictions:
+            f.write(f"{e1}\t{e2}\t{t}\t{prob:.4f}\t{pred}\t{gt}\n")
+
+    print(f"\nPredictions saved to: {output_path}")
+    print(f"  Total predictions: {len(all_predictions)}")
+    print(f"  Positive predictions (threshold={threshold}): {positive_count}")
+    
+    # Also save a summary of probability distribution
+    probs_list = [p[3] for p in all_predictions]
+    if probs_list:
+        print(f"  Probability stats: min={min(probs_list):.4f}, max={max(probs_list):.4f}, mean={sum(probs_list)/len(probs_list):.4f}")
 
 
 def main():
     """Main entry point."""
-    # Create main parser
     parser = argparse.ArgumentParser(
-        description="RAPID: A Recurrent Architecture for Predicting Protein Interaction Dynamics",
+        description="RAPID: Recurrent Architecture for Predicting Protein Interaction Dynamics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -447,79 +468,51 @@ def main():
         parents=[get_base_args()],
     )
     pretrain_parser.add_argument(
-        "--pretrain_epochs", type=int, default=30, help="Number of pretraining epochs"
+        "--pretrain_epochs", type=int, default=30, help="Pretraining epochs"
     )
     pretrain_parser.add_argument(
         "--pretrain_lr", type=float, default=1e-3, help="Pretraining learning rate"
     )
+    pretrain_parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    pretrain_parser.add_argument("--num_bases", type=int, default=5, help="RGCN bases")
     pretrain_parser.add_argument(
-        "--batch_size", type=int, default=64, help="Batch size"
-    )
-    pretrain_parser.add_argument(
-        "--pooling",
-        type=str,
-        default="max",
-        choices=["max", "mean"],
-        help="Graph pooling method",
+        "--pooling", type=str, default="max", choices=["max", "mean"],
+        help="Graph pooling method"
     )
 
     # === Train command ===
     train_parser = subparsers.add_parser(
         "train",
-        help="Train main PPI dynamics model",
+        help="Train TrajectoryRAPID model",
         parents=[get_base_args()],
     )
-    train_parser.add_argument(
-        "--epochs", type=int, default=100, help="Maximum training epochs"
-    )
+    # Architecture
+    train_parser.add_argument("--n_heads", type=int, default=4, help="Attention heads")
+    train_parser.add_argument("--n_encoder_layers", type=int, default=2, help="Encoder layers")
+    train_parser.add_argument("--n_decoder_layers", type=int, default=2, help="Decoder layers")
+    train_parser.add_argument("--n_neighbor_layers", type=int, default=1, help="Neighbor attn layers")
+    train_parser.add_argument("--max_neighbors", type=int, default=50, help="Max neighbors")
+    train_parser.add_argument("--num_rgcn_layers", type=int, default=2, help="RGCN layers")
+    train_parser.add_argument("--num_bases", type=int, default=100, help="RGCN bases")
+    # Feature flags
+    train_parser.add_argument("--no_rgcn", action="store_true", help="Disable RGCN")
+    train_parser.add_argument("--no_global", action="store_true", help="Disable global context")
+    train_parser.add_argument("--no_neighbors", action="store_true", help="Disable neighbor attention")
+    train_parser.add_argument("--use_node_features", action="store_true", help="Enable node features")
+    train_parser.add_argument("--n_hops", type=int, default=1, help="Neighbor hops")
+    # Training
+    train_parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     train_parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    train_parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    train_parser.add_argument(
-        "--neg_ratio", type=float, default=1.0, help="Negative sampling ratio"
-    )
-    train_parser.add_argument(
-        "--hard_ratio",
-        type=float,
-        default=0.5,
-        help="Hard negative ratio (history constrained)",
-    )
-    train_parser.add_argument(
-        "--focal_gamma", type=float, default=2.0, help="Focal loss gamma"
-    )
-    train_parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience"
-    )
-    train_parser.add_argument(
-        "--use_global_model", action="store_true", help="Use pretrained global model"
-    )
-    train_parser.add_argument(
-        "--global_model_path",
-        type=str,
-        default=None,
-        help="Path to global model checkpoint",
-    )
-    train_parser.add_argument(
-        "--experiment_name",
-        type=str,
-        default=None,
-        help="Experiment name for checkpoints",
-    )
-    # Node feature flags
-    train_parser.add_argument(
-        "--no_node_features",
-        action="store_true",
-        help="Disable all node features",
-    )
-    train_parser.add_argument(
-        "--no_physicochemical",
-        action="store_true",
-        help="Disable physicochemical features (only use intrachain)",
-    )
-    train_parser.add_argument(
-        "--no_intrachain_features",
-        action="store_true",
-        help="Disable intrachain features (only use physicochemical)",
-    )
+    train_parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
+    train_parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    train_parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    train_parser.add_argument("--transition_weight", type=float, default=1.0, help="Transition weight")
+    train_parser.add_argument("--focal_loss", action="store_true", help="Use focal loss")
+    train_parser.add_argument("--focal_gamma", type=float, default=2.0, help="Focal gamma")
+    # Data
+    train_parser.add_argument("--history_ratio", type=float, default=0.5, help="History ratio")
+    train_parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation ratio")
+    train_parser.add_argument("--experiment_name", type=str, default=None, help="Experiment name")
 
     # === Evaluate command ===
     eval_parser = subparsers.add_parser(
@@ -527,160 +520,74 @@ def main():
         help="Evaluate trained model",
         parents=[get_base_args()],
     )
-    eval_parser.add_argument(
-        "--checkpoint", type=str, default=None, help="Path to model checkpoint"
-    )
-    eval_parser.add_argument(
-        "--use_global_model", action="store_true", help="Use pretrained global model"
-    )
-    eval_parser.add_argument(
-        "--global_model_path",
-        type=str,
-        default=None,
-        help="Path to global model checkpoint",
-    )
-    # Prediction output options
-    eval_parser.add_argument(
-        "--predictions_dir",
-        type=str,
-        default=PREDICTIONS_DIR,
-        help="Directory to save prediction files",
-    )
+    eval_parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path")
+    eval_parser.add_argument("--n_heads", type=int, default=4, help="Attention heads")
+    eval_parser.add_argument("--n_encoder_layers", type=int, default=2, help="Encoder layers")
+    eval_parser.add_argument("--n_decoder_layers", type=int, default=2, help="Decoder layers")
+    eval_parser.add_argument("--n_neighbor_layers", type=int, default=1, help="Neighbor attn layers")
+    eval_parser.add_argument("--max_neighbors", type=int, default=50, help="Max neighbors")
+    eval_parser.add_argument("--no_rgcn", action="store_true", help="Disable RGCN")
+    eval_parser.add_argument("--no_global", action="store_true", help="Disable global context")
+    eval_parser.add_argument("--no_neighbors", action="store_true", help="Disable neighbor attention")
+    eval_parser.add_argument("--n_hops", type=int, default=1, help="Neighbor hops")
+    eval_parser.add_argument("--history_ratio", type=float, default=0.5, help="History ratio")
+    eval_parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation ratio")
+    eval_parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    eval_parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (unused)")
 
     # === All command (full pipeline) ===
     all_parser = subparsers.add_parser(
         "all",
-        help="Run full pipeline: preprocess -> pretrain (optional) -> train -> evaluate",
+        help="Run full pipeline: preprocess -> pretrain -> train -> evaluate",
         parents=[get_base_args()],
     )
-    # Preprocess args
-    all_parser.add_argument(
-        "--data_dir",
-        type=str,
-        default=None,
-        help="Raw data directory with .interfacea files (optional, skip if data preprocessed)",
-    )
-    all_parser.add_argument(
-        "--replica",
-        type=str,
-        default=None,
-        help="Replica name for preprocessing (e.g., replica1)",
-    )
-    all_parser.add_argument(
-        "--test_ratio",
-        type=float,
-        default=0.2,
-        help="Test/validation ratio for preprocessing (default: 0.2)",
-    )
-    # Pretrain args
-    all_parser.add_argument(
-        "--pretrain_epochs", type=int, default=30, help="Number of pretraining epochs"
-    )
-    all_parser.add_argument(
-        "--pretrain_lr", type=float, default=1e-3, help="Pretraining learning rate"
-    )
-    all_parser.add_argument(
-        "--pooling",
-        type=str,
-        default="max",
-        choices=["max", "mean"],
-        help="Graph pooling method",
-    )
-    # Train args
-    all_parser.add_argument(
-        "--epochs", type=int, default=100, help="Maximum training epochs"
-    )
+    # Preprocess
+    all_parser.add_argument("--raw_data_dir", type=str, default=None, help="Raw data directory")
+    all_parser.add_argument("--replica", type=str, default=None, help="Replica name")
+    all_parser.add_argument("--test_ratio", type=float, default=0.2, help="Test ratio")
+    # Pretrain
+    all_parser.add_argument("--pretrain_epochs", type=int, default=30, help="Pretrain epochs")
+    all_parser.add_argument("--pretrain_lr", type=float, default=1e-3, help="Pretrain LR")
+    all_parser.add_argument("--pooling", type=str, default="max", help="Pooling method")
+    all_parser.add_argument("--use_global_model", action="store_true", help="Use global model")
+    all_parser.add_argument("--num_bases", type=int, default=100, help="RGCN bases")
+    # Architecture
+    all_parser.add_argument("--n_heads", type=int, default=4, help="Attention heads")
+    all_parser.add_argument("--n_encoder_layers", type=int, default=2, help="Encoder layers")
+    all_parser.add_argument("--n_decoder_layers", type=int, default=2, help="Decoder layers")
+    all_parser.add_argument("--n_neighbor_layers", type=int, default=1, help="Neighbor attn layers")
+    all_parser.add_argument("--max_neighbors", type=int, default=50, help="Max neighbors")
+    all_parser.add_argument("--num_rgcn_layers", type=int, default=2, help="RGCN layers")
+    # Feature flags
+    all_parser.add_argument("--no_rgcn", action="store_true", help="Disable RGCN")
+    all_parser.add_argument("--no_global", action="store_true", help="Disable global context")
+    all_parser.add_argument("--no_neighbors", action="store_true", help="Disable neighbor attention")
+    all_parser.add_argument("--use_node_features", action="store_true", help="Enable node features")
+    all_parser.add_argument("--n_hops", type=int, default=1, help="Neighbor hops")
+    # Training
+    all_parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     all_parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    all_parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    all_parser.add_argument(
-        "--neg_ratio", type=float, default=1.0, help="Negative sampling ratio"
-    )
-    all_parser.add_argument(
-        "--hard_ratio",
-        type=float,
-        default=0.5,
-        help="Hard negative ratio (history constrained)",
-    )
-    all_parser.add_argument(
-        "--focal_gamma", type=float, default=2.0, help="Focal loss gamma"
-    )
-    all_parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience"
-    )
-    all_parser.add_argument(
-        "--use_global_model", action="store_true", help="Use pretrained global model"
-    )
-    all_parser.add_argument(
-        "--global_model_path",
-        type=str,
-        default=None,
-        help="Path to global model checkpoint",
-    )
-    all_parser.add_argument(
-        "--experiment_name",
-        type=str,
-        default=None,
-        help="Experiment name for checkpoints",
-    )
-    all_parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to model checkpoint (for evaluate only)",
-    )
-    # Prediction output options
-    all_parser.add_argument(
-        "--predictions_dir",
-        type=str,
-        default=PREDICTIONS_DIR,
-        help="Directory to save prediction files",
-    )
-    # Node feature flags
-    all_parser.add_argument(
-        "--no_node_features",
-        action="store_true",
-        help="Disable all node features",
-    )
-    all_parser.add_argument(
-        "--no_physicochemical",
-        action="store_true",
-        help="Disable physicochemical features (only use intrachain)",
-    )
-    all_parser.add_argument(
-        "--no_intrachain_features",
-        action="store_true",
-        help="Disable intrachain features (only use physicochemical)",
-    )
+    all_parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
+    all_parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    all_parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    all_parser.add_argument("--transition_weight", type=float, default=1.0, help="Transition weight")
+    all_parser.add_argument("--focal_loss", action="store_true", help="Use focal loss")
+    all_parser.add_argument("--focal_gamma", type=float, default=2.0, help="Focal gamma")
+    # Data
+    all_parser.add_argument("--history_ratio", type=float, default=0.5, help="History ratio")
+    all_parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation ratio")
+    all_parser.add_argument("--experiment_name", type=str, default=None, help="Experiment name")
+    all_parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint (eval only)")
 
     # === Preprocess command ===
     preprocess_parser = subparsers.add_parser(
         "preprocess",
-        help="Preprocess raw MD simulation data into RAPID format",
+        help="Preprocess raw MD simulation data",
     )
-    preprocess_parser.add_argument(
-        "--data_dir",
-        type=str,
-        required=True,
-        help="Directory containing replica folders with .interfacea files",
-    )
-    preprocess_parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Output directory for processed data files",
-    )
-    preprocess_parser.add_argument(
-        "--replica",
-        type=str,
-        required=True,
-        help="Replica name (e.g., replica1)",
-    )
-    preprocess_parser.add_argument(
-        "--test_ratio",
-        type=float,
-        default=0.2,
-        help="Fraction of timeline for test set; validation uses same ratio (default: 0.2)",
-    )
+    preprocess_parser.add_argument("--data_dir", type=str, required=True, help="Raw data directory")
+    preprocess_parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    preprocess_parser.add_argument("--replica", type=str, required=True, help="Replica name")
+    preprocess_parser.add_argument("--test_ratio", type=float, default=0.2, help="Test ratio")
 
     args = parser.parse_args()
 
@@ -702,7 +609,6 @@ def main():
         run_pretrain(args)
 
     elif args.command == "train":
-        # Setup experiment name
         if args.experiment_name is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             args.experiment_name = f"{args.dataset}_{timestamp}"
@@ -740,9 +646,9 @@ def main():
             args.experiment_name = f"{args.dataset}_{timestamp}"
 
         # Step 0: Preprocess (if raw data provided)
-        if hasattr(args, "data_dir") and args.data_dir:
+        if hasattr(args, "raw_data_dir") and args.raw_data_dir:
             preprocess_config = PreprocessingConfig(
-                data_directory=Path(args.data_dir),
+                data_directory=Path(args.raw_data_dir),
                 output_directory=DATA_DIR / args.dataset,
                 replica=args.replica,
                 test_ratio=args.test_ratio if hasattr(args, "test_ratio") else 0.2,

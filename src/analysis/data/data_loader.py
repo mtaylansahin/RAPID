@@ -160,6 +160,10 @@ class DataLoader:
     def _load_output_file(self, output_file_path: str) -> pd.DataFrame:
         """Load the output/prediction file.
         
+        Supports two formats:
+        - Legacy: 3 columns (subject, object, time_stamp)
+        - Extended: 6 columns (subject, object, time_stamp, probability, prediction, ground_truth)
+        
         Args:
             output_file_path: Path to output file
             
@@ -172,8 +176,20 @@ class DataLoader:
             raise FileNotFoundError(f"Output file not found: {output_path}")
         
         try:
-            df = pd.read_csv(output_path, sep=r"\s+", header=None)
-            df.columns = ['subject', 'object', 'time_stamp']
+            # Read file, skip comment lines
+            df = pd.read_csv(output_path, sep=r"\s+", header=None, comment='#')
+            
+            n_cols = df.shape[1]
+            if n_cols == 3:
+                # Legacy format
+                df.columns = ['subject', 'object', 'time_stamp']
+            elif n_cols == 6:
+                # Extended format with probabilities and ground truth
+                df.columns = ['subject', 'object', 'time_stamp', 'probability', 'prediction', 'ground_truth']
+                # Filter to only positive predictions for compatibility with analysis
+                df = df[df['prediction'] == 1][['subject', 'object', 'time_stamp']].copy()
+            else:
+                raise ValueError(f"Unexpected format: expected 3 or 6 columns, got {n_cols}")
             
             self.logger.info(f"Loaded output file with {len(df)} rows")
             return df
