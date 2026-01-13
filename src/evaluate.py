@@ -1,4 +1,4 @@
-"""Evaluation module for RAPID - Protein Interaction Dynamics prediction."""
+"""Evaluation module for RAPID encoder-decoder architecture."""
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,68 +8,235 @@ import torch
 from tqdm import tqdm
 
 from src.data.dataset import PPIDataModule
-from src.losses import get_loss_function
 from src.metrics import (
     ClassificationMetrics,
     MetricsComputer,
     PerTimestepMetrics,
+    TransitionMetrics,
     compute_per_timestep_metrics,
+    compute_transition_metrics,
 )
-from src.models.global_model import PPIGlobalModel
-from src.models.rapid import RAPIDModel
+from src.models.decoder import TemporalEdgeDecoder
+from src.models.encoder import RAPIDEncoder
 
 
 class Evaluator:
     """
-    Evaluator for RAPID model.
+    Evaluator for RAPID encoder-decoder model.
 
-    Uses all-pairs evaluation for unbiased metrics.
-    Supports autoregressive inference with predicted history.
+    Performs seq2seq evaluation on test timesteps with transition metrics.
 
     Args:
-        model: Trained RAPIDModel
+        encoder: RAPIDEncoder wrapper
+        decoder: TemporalEdgeDecoder
         data_module: Data module with test data
-        device: torch device
+        device: Torch device
         threshold: Classification threshold
     """
 
     def __init__(
         self,
-        model: RAPIDModel,
+        encoder: RAPIDEncoder,
+        decoder: TemporalEdgeDecoder,
         data_module: PPIDataModule,
         device: torch.device,
         threshold: float = 0.5,
-        global_model: Optional[PPIGlobalModel] = None,
     ):
-        self.model = model.to(device)
+        self.encoder = encoder.to(device)
+        self.decoder = decoder.to(device)
         self.data_module = data_module
         self.device = device
         self.threshold = threshold
 
-        # Global model (optional)
-        self.global_model = global_model
-        if global_model is not None:
-            self.global_model = global_model.to(device)
-            self.global_model.eval()
-            self.global_emb = global_model.global_emb
-        else:
-            self.global_emb = None
+        # Prepare known pairs and timesteps
+        self.known_pairs = self._get_known_pairs()
+        self.train_max_time = data_module.train_max_time
+        self.test_timesteps = sorted(data_module.test_dataset.unique_timesteps)
 
-        self.criterion = get_loss_function(loss_type="focal", gamma=2.0)
-
-        # Storage for predictions (to save to file)
+        # Storage for predictions
         self.predictions: List[Tuple[int, int, int, int, float, int]] = []
+        self._cached_results: Optional[Dict[str, Any]] = None
 
-    def save_predictions(
-        self,
-        output_path: Path,
-    ) -> None:
-        """
-        Save predicted interactions to a text file.
+    def _get_known_pairs(self) -> torch.Tensor:
+        """Get all known pairs as tensor."""
+        if not hasattr(self.data_module, "known_pairs_list"):
+            self.data_module.get_history_pairs_for_timestep(0, split="test")
+        return torch.tensor(self.data_module.known_pairs_list, dtype=torch.long)
 
-        Args:
-            output_path: Path to save the predictions file
+    def _get_target_matrix(self, timesteps: List[int]) -> torch.Tensor:
+        """Build target matrix for all pairs × timesteps."""
+        dataset = self.data_module.test_dataset
+        num_pairs = len(self.known_pairs)
+        num_timesteps = len(timesteps)
+
+        targets = torch.zeros(num_pairs, num_timesteps)
+
+        for t_idx, t in enumerate(timesteps):
+            pos_edges = dataset.positives_by_timestep.get(t, set())
+            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+                if (e1, e2) in pos_edges or (e2, e1) in pos_edges:
+                    targets[p_idx, t_idx] = 1.0
+
+        return targets
+
+    def _get_previous_states(self, timesteps: List[int]) -> torch.Tensor:
+        """Get edge states at the timestep before the first test timestep."""
+        first_test_t = min(timesteps)
+
+        # Find the previous timestep
+        all_times = sorted(
+            set(self.data_module.train_dataset.timesteps)
+            | set(self.data_module.val_dataset.timesteps)
+        )
+        prev_t = None
+        for t in reversed(all_times):
+            if t < first_test_t:
+                prev_t = t
+                break
+
+        prev_states = torch.zeros(len(self.known_pairs))
+
+        if prev_t is not None:
+            # Get edges at prev_t
+            prev_edges = set()
+            for ds in [
+                self.data_module.train_dataset,
+                self.data_module.val_dataset,
+            ]:
+                prev_edges.update(ds.positives_by_timestep.get(prev_t, set()))
+
+            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+                if (e1, e2) in prev_edges or (e2, e1) in prev_edges:
+                    prev_states[p_idx] = 1.0
+
+        return prev_states
+
+    def _get_edge_history(self) -> torch.Tensor:
         """
+        Get FULL edge state history for each pair from train+val data.
+
+        Returns:
+            edge_history: (num_pairs, num_timesteps) binary tensor
+                          ordered chronologically (oldest first, newest last)
+        """
+        # Get all train+val timesteps sorted chronologically
+        all_times = sorted(
+            set(self.data_module.train_dataset.timesteps)
+            | set(self.data_module.val_dataset.timesteps)
+        )
+
+        num_pairs = len(self.known_pairs)
+        num_timesteps = len(all_times)
+        edge_history = torch.zeros(num_pairs, num_timesteps)
+
+        # Fill history chronologically
+        for t_idx, t in enumerate(all_times):
+            pos_edges = set()
+            for ds in [self.data_module.train_dataset, self.data_module.val_dataset]:
+                pos_edges.update(ds.positives_by_timestep.get(t, set()))
+
+            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+                if (e1, e2) in pos_edges or (e2, e1) in pos_edges:
+                    edge_history[p_idx, t_idx] = 1.0
+
+        return edge_history
+
+    @torch.no_grad()
+    def run_inference(self, force_rerun: bool = False) -> Dict[str, Any]:
+        """
+        Run seq2seq inference on test set.
+
+        Returns:
+            Dictionary with logits, predictions, and targets
+        """
+        if not force_rerun and self._cached_results is not None:
+            return self._cached_results
+
+        self.encoder.eval()
+        self.decoder.eval()
+
+        print("\nRunning seq2seq inference...")
+
+        # Use train+val context
+        context_graph_dict, context_history, context_history_t = (
+            self.data_module.get_train_val_context()
+        )
+
+        # Encode all entities
+        entity_context = self.encoder(
+            context_graph_dict, context_history, context_history_t
+        )
+
+        # Get targets
+        target_matrix = self._get_target_matrix(self.test_timesteps)
+        prev_states = self._get_previous_states(self.test_timesteps)
+
+        # Relative timesteps
+        relative_t = torch.tensor(
+            [t - self.train_max_time for t in self.test_timesteps],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Get edge history if decoder uses it
+        # Get edge history if decoder uses it
+        edge_history = None
+        if self.decoder.use_edge_history:
+            edge_history = self._get_edge_history().to(self.device)
+
+        # Predict in batches
+        all_logits = []
+        all_probs = []
+        pair_batch_size = 512
+
+        for start_idx in tqdm(
+            range(0, len(self.known_pairs), pair_batch_size),
+            desc="Predicting",
+        ):
+            end_idx = min(start_idx + pair_batch_size, len(self.known_pairs))
+            batch_pairs = self.known_pairs[start_idx:end_idx].to(self.device)
+
+            # Get edge history batch
+            batch_edge_history = None
+            if edge_history is not None:
+                batch_edge_history = edge_history[start_idx:end_idx]
+
+            probs, preds, logits = self.decoder.predict(
+                entity_context,
+                batch_pairs,
+                relative_t,
+                edge_history=batch_edge_history,
+                threshold=self.threshold,
+            )
+            all_logits.append(logits.cpu())
+            all_probs.append(probs.cpu())
+
+        all_logits = torch.cat(all_logits, dim=0)  # (num_pairs, num_timesteps)
+        all_probs = torch.cat(all_probs, dim=0)
+        all_preds = (all_probs >= self.threshold).long()
+
+        # Store detailed predictions
+        self.predictions = []
+        for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+            for t_idx, t in enumerate(self.test_timesteps):
+                prob = float(all_probs[p_idx, t_idx])
+                pred = int(all_preds[p_idx, t_idx])
+                self.predictions.append((e1, 1, e2, t, prob, pred))
+
+        results = {
+            "logits": all_logits,
+            "probs": all_probs,
+            "predictions": all_preds,
+            "targets": target_matrix,
+            "prev_states": prev_states,
+            "timesteps": self.test_timesteps,
+        }
+
+        self._cached_results = results
+        return results
+
+    def save_predictions(self, output_path: Path) -> None:
+        """Save predicted interactions to file."""
         if not self.predictions:
             print("Warning: No predictions to save. Run evaluation first.")
             return
@@ -86,207 +253,102 @@ class Evaluator:
         print(f"\nPredictions saved to: {output_path}")
         print(f"  Positive predictions: {num_positive}")
 
-    def run_inference(
-        self,
-        split: str = "test",
-        force_rerun: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Run autoregressive inference loop and cache results.
+    def evaluate(self) -> ClassificationMetrics:
+        """Compute overall classification metrics."""
+        results = self.run_inference()
 
-        Args:
-            split: 'valid' or 'test'
-            force_rerun: If True, ignore cache and rerun
-
-        Returns:
-            Dictionary containing:
-            - logits: torch.Tensor
-            - labels: torch.Tensor
-            - timesteps: torch.Tensor
-            - predictions: List of tuples (e1, rel, e2, t, score, pred)
-        """
-        # Return cached results if available
-        if (
-            not force_rerun
-            and hasattr(self, "_cached_results")
-            and self._cached_results.get("split") == split
-        ):
-            return self._cached_results
-
-        self.model.eval()
-
-        # Get dataset and timesteps
-        if split == "valid":
-            dataset = self.data_module.val_dataset
-            # For validation, use train context only
-            context_graph_dict = self.data_module.graph_dict
-            context_history = self.data_module.entity_history
-            context_history_t = self.data_module.entity_history_t
-        else:
-            dataset = self.data_module.test_dataset
-            # For test, use train + val context
-            context_graph_dict, context_history, context_history_t = (
-                self.data_module.get_train_val_context()
-            )
-
-        # Extend global embeddings if needed
-        if self.global_model is not None:
-            print("Extending global embeddings...")
-            self.global_model.extend_embeddings(context_graph_dict)
-            self.global_emb = self.global_model.global_emb
-
-        # Initialize model with historical context
-        self.model.reset_inference_state()
-        self.model.init_from_train_history(
-            graph_dict=context_graph_dict,
-            entity_history=context_history,
-            entity_history_t=context_history_t,
-            global_emb=self.global_emb,
-            global_model=self.global_model,
-        )
-
-        # Collect all predictions
-        all_logits = []
-        all_labels = []
-        all_timesteps = []
-        detailed_predictions = []
-
-        print(f"\nRunning inference on {split} set...")
-
-        # Get unique timesteps from dataset
-        timesteps = sorted(dataset.unique_timesteps)
-
-        for t in tqdm(timesteps, desc="Timesteps"):
-            # Get known history pairs
-            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(
-                t, split=split
-            )
-
-            # Process in batches
-            batch_size = 128
-            for i in range(0, len(pairs), batch_size):
-                batch_pairs = pairs[i : i + batch_size]
-                batch_labels = labels_np[i : i + batch_size]
-
-                entity1 = torch.LongTensor(batch_pairs[:, 0]).to(self.device)
-                entity2 = torch.LongTensor(batch_pairs[:, 1]).to(self.device)
-                labels = torch.FloatTensor(batch_labels).to(self.device)
-
-                # Get predictions (updates internal state)
-                probs, preds = self.model.predict_batch(
-                    entity1_ids=entity1,
-                    entity2_ids=entity2,
-                    timestep=t,
-                    threshold=self.threshold,
-                    update_history=True,
-                )
-
-                # Convert probs to logits for metrics
-                probs_clamped = probs.clamp(1e-7, 1 - 1e-7)
-                logits = torch.log(probs_clamped / (1 - probs_clamped))
-
-                all_logits.append(logits.cpu())
-                all_labels.append(labels.cpu())
-                all_timesteps.append(torch.full((len(labels),), t))
-
-                # Store detailed predictions
-                probs_np = probs.cpu().numpy()
-                preds_np = preds.cpu().numpy()
-                e1_np = entity1.cpu().numpy()
-                e2_np = entity2.cpu().numpy()
-
-                for j in range(len(e1_np)):
-                    detailed_predictions.append(
-                        (
-                            int(e1_np[j]),
-                            1,  # relation (assumed 1 for now or from graph)
-                            int(e2_np[j]),
-                            int(t),
-                            float(probs_np[j]),
-                            int(preds_np[j]),
-                        )
-                    )
-
-        # Concatenate results
-        results = {
-            "split": split,
-            "logits": torch.cat(all_logits),
-            "labels": torch.cat(all_labels),
-            "timesteps": torch.cat(all_timesteps),
-            "predictions": detailed_predictions,
-        }
-
-        # Cache results
-        self._cached_results = results
-        return results
-
-    @torch.no_grad()
-    def evaluate(
-        self,
-        split: str = "test",
-        collect_predictions: bool = False,
-    ) -> ClassificationMetrics:
-        """
-        Compute classification metrics.
-
-        Uses cached inference results if available.
-        """
-        results = self.run_inference(split=split)
-
-        logits = results["logits"]
-        labels = results["labels"]
-        self.predictions = results["predictions"] if collect_predictions else []
+        logits_flat = results["logits"].view(-1)
+        targets_flat = results["targets"].view(-1)
 
         # Report class balance
-        n_pos = labels.sum().item()
-        n_neg = len(labels) - n_pos
-        print(f"  Total pairs: {len(labels)} ({n_pos} positive, {n_neg} negative)")
+        n_pos = targets_flat.sum().item()
+        n_neg = len(targets_flat) - n_pos
+        print(
+            f"\n  Total samples: {len(targets_flat)} ({int(n_pos)} positive, {int(n_neg)} negative)"
+        )
         print(f"  Class ratio: 1:{n_neg / max(n_pos, 1):.1f}")
 
         metrics_computer = MetricsComputer(threshold=self.threshold)
-        metrics_computer.update(logits, labels)
+        metrics_computer.update(logits_flat, targets_flat)
 
-        return metrics_computer.compute()
+        return metrics_computer.compute(tune_threshold=True)
 
-    @torch.no_grad()
-    def evaluate_per_timestep(self, split: str = "test") -> PerTimestepMetrics:
-        """
-        Compute metrics per timestep.
+    def evaluate_per_timestep(self) -> PerTimestepMetrics:
+        """Compute metrics per timestep."""
+        results = self.run_inference()
 
-        Uses cached inference results if available.
-        """
-        results = self.run_inference(split=split)
+        logits_flat = results["logits"].view(-1)
+        targets_flat = results["targets"].view(-1)
+
+        # Build timestep tensor
+        num_pairs = len(self.known_pairs)
+        timesteps_tensor = torch.tensor(
+            [t for t in self.test_timesteps for _ in range(num_pairs)]
+        )
+
+        # Reshape correctly: (pairs, timesteps) -> (pairs * timesteps,)
+        # Each pair has all timesteps, so we need to expand differently
+        timesteps_per_sample = (
+            torch.tensor(self.test_timesteps)
+            .unsqueeze(0)
+            .expand(num_pairs, -1)
+            .reshape(-1)
+        )
 
         return compute_per_timestep_metrics(
-            results["logits"],
-            results["labels"],
-            results["timesteps"],
+            logits_flat,
+            targets_flat,
+            timesteps_per_sample,
             threshold=self.threshold,
         )
 
-    def full_evaluation(self, split: str = "test") -> Dict[str, Any]:
+    def evaluate_transitions(self) -> TransitionMetrics:
+        """Compute transition-focused metrics."""
+        results = self.run_inference()
+
+        return compute_transition_metrics(
+            results["predictions"],
+            results["targets"],
+            results["prev_states"],
+        )
+
+    def full_evaluation(self) -> Dict[str, Any]:
         """
         Run full evaluation with all analyses.
 
-        Runs inference ONCE and computes both overall and per-timestep metrics.
+        Returns comprehensive metrics including:
+        - Overall classification metrics
+        - Per-timestep breakdown
+        - Transition-focused metrics
         """
-        # Force a fresh run for full evaluation
-        self.run_inference(split=split, force_rerun=True)
+        # Force fresh run
+        self.run_inference(force_rerun=True)
 
-        results = {}
+        output = {}
 
-        # Main evaluation (uses cache)
-        metrics = self.evaluate(split=split, collect_predictions=True)
-        results["metrics"] = metrics.to_dict()
-        print(f"\n{split.capitalize()} Results:")
-        print(f"  {metrics}")
+        # Main metrics
+        print("\n" + "=" * 50)
+        print("Test Results")
+        print("=" * 50)
 
-        # Per-timestep analysis (uses cache)
-        per_ts_metrics = self.evaluate_per_timestep(split=split)
-        results["per_timestep"] = per_ts_metrics.to_dict()
-        print("\nPer-Timestep Analysis:")
+        metrics = self.evaluate()
+        output["metrics"] = metrics.to_dict()
+        print(f"\n{metrics}")
+
+        # Per-timestep analysis
+        per_ts_metrics = self.evaluate_per_timestep()
+        output["per_timestep"] = per_ts_metrics.to_dict()
+        print(f"\nPer-Timestep Analysis:")
         print(f"  Mean AUPRC: {per_ts_metrics.mean_auprc:.4f}")
         print(f"  Mean F1: {per_ts_metrics.mean_f1:.4f}")
+
+        # Transition metrics
+        trans_metrics = self.evaluate_transitions()
+        output["transitions"] = trans_metrics.to_dict()
+        print(f"\nTransition Analysis:")
+        print(f"  {trans_metrics}")
+        print(f"  ON→OFF Recall: {trans_metrics.on_to_off_recall:.3f}")
+        print(f"  OFF→ON Recall: {trans_metrics.off_to_on_recall:.3f}")
 
         # Check for temporal degradation
         if len(per_ts_metrics.auprcs) > 5:
@@ -294,8 +356,10 @@ class Evaluator:
             late = np.mean(per_ts_metrics.auprcs[-5:])
             if late < early * 0.9:
                 print(
-                    f"  ⚠️ Temporal degradation detected: "
+                    f"\n  ⚠️ Temporal degradation detected: "
                     f"early AUPRC {early:.4f} vs late {late:.4f}"
                 )
 
-        return results
+        print("=" * 50)
+
+        return output

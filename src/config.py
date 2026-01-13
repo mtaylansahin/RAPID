@@ -74,3 +74,20 @@ class TrainingConfig:
 
     # Logging
     eval_interval: int = 1  # Evaluate every N epochs
+
+    # Encoder-decoder training
+    encoder_lr: float = 1e-5  # Lower LR for encoder fine-tuning
+    freeze_encoder: bool = True  # Freeze encoder during decoder training
+    encoder_pretrain_epochs: int = 30  # Epochs for encoder pretraining
+    transition_weight: float = 1.0  # Weight for transition samples vs persistence
+
+
+@dataclass
+class DecoderConfig:
+    """Configuration for Transformer decoder."""
+
+    hidden_dim: int = 200
+    num_layers: int = 4
+    num_heads: int = 8
+    max_timesteps: int = 200
+    dropout: float = 0.1

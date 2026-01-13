@@ -1,8 +1,8 @@
-"""Training module for RAPID - Protein Interaction Dynamics prediction."""
+"""Training module for RAPID encoder-decoder architecture."""
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
 
 import torch
 from tqdm import tqdm
@@ -10,269 +10,384 @@ from tqdm import tqdm
 from src.config import TrainingConfig
 from src.data.dataset import PPIDataModule
 from src.losses import get_loss_function
-from src.metrics import ClassificationMetrics, MetricsComputer, find_optimal_threshold
-from src.models.global_model import PPIGlobalModel
-from src.models.rapid import RAPIDModel
+from src.metrics import ClassificationMetrics, MetricsComputer
+from src.models.decoder import TemporalEdgeDecoder
+from src.models.encoder import RAPIDEncoder
 
 
 class Trainer:
     """
-    Trainer for RAPID model.
+    Trainer for RAPID encoder-decoder model.
 
-    Handles:
-    - Training loop with oracle (ground-truth) history
-    - Validation with autoregressive (predicted) history
-    - Checkpointing and early stopping
-    - Detailed metric logging
+    Trains decoder using validation timesteps as targets.
+    Encoder can be frozen or fine-tuned with lower learning rate.
 
     Args:
-        model: RAPIDModel instance
+        encoder: RAPIDEncoder wrapper
+        decoder: TemporalEdgeDecoder
         data_module: PPIDataModule with train/val/test data
-        config: Training configuration
-        device: torch device
+        config: TrainingConfig
+        device: Torch device
+        checkpoint_dir: Directory to save checkpoints
+        log_dir: Directory to save logs
     """
 
     def __init__(
         self,
-        model: RAPIDModel,
+        encoder: RAPIDEncoder,
+        decoder: TemporalEdgeDecoder,
         data_module: PPIDataModule,
         config: TrainingConfig,
         device: torch.device,
         checkpoint_dir: Path,
         log_dir: Path,
-        global_model: Optional[PPIGlobalModel] = None,
     ):
-        self.model = model.to(device)
+        self.encoder = encoder.to(device)
+        self.decoder = decoder.to(device)
         self.data_module = data_module
         self.config = config
         self.device = device
-        self.checkpoint_dir = checkpoint_dir
-        self.log_dir = log_dir
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.log_dir = Path(log_dir)
 
-        self.global_model = global_model
-        if global_model is not None:
-            self.global_model = global_model.to(device)
-            self.global_model.eval()
-            self.global_emb = global_model.global_emb
-        else:
-            self.global_emb = None
+        # Optimizer: different LR for encoder vs decoder
+        param_groups = [
+            {"params": self.decoder.parameters(), "lr": config.learning_rate},
+        ]
+        if not config.freeze_encoder:
+            param_groups.append(
+                {
+                    "params": self.encoder.parameters(),
+                    "lr": config.encoder_lr,
+                }
+            )
 
         self.optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
+            param_groups, weight_decay=config.weight_decay
         )
+        self.criterion = get_loss_function(loss_type="focal", gamma=config.focal_gamma)
 
-        self.criterion = get_loss_function(
-            loss_type="focal",
-            gamma=config.focal_gamma,
-            alpha=config.focal_alpha,
-        )
+        # Get known pairs and timesteps
+        self.known_pairs = self._get_known_pairs()
+        self.train_max_time = data_module.train_max_time
+        self.val_timesteps = sorted(data_module.val_dataset.unique_timesteps)
+        self.test_timesteps = sorted(data_module.test_dataset.unique_timesteps)
 
-        self.train_metrics = MetricsComputer()
-        self.val_metrics = MetricsComputer()
-
+        # Tracking
         self.best_val_auprc = 0.0
         self.best_epoch = 0
-        self.patience_counter = 0
-
         self.optimal_threshold = 0.5
-
-        self.history: Dict[str, list] = {
+        self.patience_counter = 0
+        self.history: Dict[str, List[float]] = {
             "train_loss": [],
-            "train_auprc": [],
-            "train_auroc": [],
-            "train_f1": [],
-            "val_loss": [],
             "val_auprc": [],
-            "val_auroc": [],
             "val_f1": [],
         }
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    def train_epoch(self, epoch: int) -> ClassificationMetrics:
-        """Train for one epoch."""
-        self.model.train()
-        self.train_metrics.reset()
+    def _get_known_pairs(self) -> torch.Tensor:
+        """Get all known pairs as tensor."""
+        if not hasattr(self.data_module, "known_pairs_list"):
+            # Trigger lazy computation
+            self.data_module.get_history_pairs_for_timestep(0, split="test")
+        return torch.tensor(self.data_module.known_pairs_list, dtype=torch.long)
 
-        dataloader = self.data_module.get_train_dataloader()
+    def _get_target_matrix(self, timesteps: List[int], split: str) -> torch.Tensor:
+        """
+        Build target matrix for all pairs × timesteps.
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch:03d} [Train]")
+        Args:
+            timesteps: List of timesteps
+            split: 'valid' or 'test'
 
-        for batch in pbar:
-            entity1 = batch["entity1"].to(self.device)
-            entity2 = batch["entity2"].to(self.device)
-            labels = batch["labels"].to(self.device)
+        Returns:
+            targets: (num_pairs, num_timesteps) binary tensor
+        """
+        dataset = (
+            self.data_module.val_dataset
+            if split == "valid"
+            else self.data_module.test_dataset
+        )
+        num_pairs = len(self.known_pairs)
+        num_timesteps = len(timesteps)
 
-            logits = self.model(
-                entity1_ids=entity1,
-                entity2_ids=entity2,
-                entity1_history=batch["entity1_history"],
-                entity2_history=batch["entity2_history"],
-                entity1_history_t=batch["entity1_history_t"],
-                entity2_history_t=batch["entity2_history_t"],
-                graph_dict=self.data_module.graph_dict,
-                global_emb=self.global_emb,
+        targets = torch.zeros(num_pairs, num_timesteps)
+
+        for t_idx, t in enumerate(timesteps):
+            pos_edges = dataset.positives_by_timestep.get(t, set())
+            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+                if (e1, e2) in pos_edges or (e2, e1) in pos_edges:
+                    targets[p_idx, t_idx] = 1.0
+
+        return targets
+
+    def _get_previous_states(self, timesteps: List[int], split: str) -> torch.Tensor:
+        """
+        Get edge states at timestep before each target timestep.
+
+        Returns:
+            prev_states: (num_pairs, num_timesteps) with state at t-1 for each t
+        """
+        # Build list of all timesteps we have data for
+        all_times = sorted(
+            set(self.data_module.train_dataset.timesteps)
+            | set(self.data_module.val_dataset.timesteps)
+        )
+
+        num_pairs = len(self.known_pairs)
+        num_timesteps = len(timesteps)
+        prev_states = torch.zeros(num_pairs, num_timesteps)
+
+        for t_idx, t in enumerate(timesteps):
+            # Find previous timestep
+            prev_t = None
+            for candidate in reversed(all_times):
+                if candidate < t:
+                    prev_t = candidate
+                    break
+
+            if prev_t is None:
+                continue
+
+            # Get edges at prev_t
+            prev_edges = set()
+            for ds in [self.data_module.train_dataset, self.data_module.val_dataset]:
+                prev_edges.update(ds.positives_by_timestep.get(prev_t, set()))
+
+            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+                if (e1, e2) in prev_edges or (e2, e1) in prev_edges:
+                    prev_states[p_idx, t_idx] = 1.0
+
+        return prev_states
+
+    def _get_edge_history(self) -> torch.Tensor:
+        """
+        Get FULL edge state history for each pair from training data.
+
+        Returns:
+            edge_history: (num_pairs, num_train_timesteps) binary tensor
+                          ordered chronologically (oldest first, newest last)
+        """
+        # Get all train timesteps sorted chronologically
+        train_times = sorted(set(self.data_module.train_dataset.timesteps))
+
+        num_pairs = len(self.known_pairs)
+        num_timesteps = len(train_times)
+        edge_history = torch.zeros(num_pairs, num_timesteps)
+
+        # Fill history chronologically
+        for t_idx, t in enumerate(train_times):
+            pos_edges = self.data_module.train_dataset.positives_by_timestep.get(
+                t, set()
             )
-            loss = self.criterion(logits, labels)
+            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
+                if (e1, e2) in pos_edges or (e2, e1) in pos_edges:
+                    edge_history[p_idx, t_idx] = 1.0
+
+        return edge_history
+
+    def train_epoch(self, epoch: int) -> float:
+        """Train for one epoch on validation timesteps."""
+        if self.config.freeze_encoder:
+            self.encoder.eval()
+        else:
+            self.encoder.train()
+        self.decoder.train()
+
+        # Encode context from training data
+        with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
+            entity_context = self.encoder(
+                self.data_module.graph_dict,
+                self.data_module.entity_history,
+                self.data_module.entity_history_t,
+            )
+
+        # Prepare targets
+        target_matrix = self._get_target_matrix(self.val_timesteps, "valid").to(
+            self.device
+        )
+
+        # Relative timesteps (from train boundary)
+        relative_t = torch.tensor(
+            [t - self.train_max_time for t in self.val_timesteps],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Get previous states for transition weighting
+        prev_states = None
+        if self.config.transition_weight > 1.0:
+            prev_states = self._get_previous_states(self.val_timesteps, "valid").to(
+                self.device
+            )
+
+        # Get edge history if decoder uses it
+        edge_history = None
+        if self.decoder.use_edge_history:
+            edge_history = self._get_edge_history().to(self.device)
+
+        # Forward pass (process pairs in batches for memory)
+        pair_batch_size = 256
+        total_loss = 0.0
+        num_batches = 0
+
+        pbar = tqdm(
+            range(0, len(self.known_pairs), pair_batch_size),
+            desc=f"Epoch {epoch:03d}",
+        )
+
+        for start_idx in pbar:
+            end_idx = min(start_idx + pair_batch_size, len(self.known_pairs))
+            batch_pairs = self.known_pairs[start_idx:end_idx].to(self.device)
+            batch_targets = target_matrix[start_idx:end_idx]
+
+            # Get edge history batch
+            batch_edge_history = None
+            if edge_history is not None:
+                batch_edge_history = edge_history[start_idx:end_idx]
+
+            # Decode
+            logits = self.decoder(
+                entity_context, batch_pairs, relative_t, edge_history=batch_edge_history
+            )
+
+            # Compute transition weights
+            if self.config.transition_weight > 1.0:
+                batch_prev = prev_states[start_idx:end_idx]
+                # Identify transitions: where prev != target
+                is_transition = (batch_prev != batch_targets).float()
+                # Weight: transition_weight for transitions, 1.0 for persistence
+                weights = 1.0 + (self.config.transition_weight - 1.0) * is_transition
+                weights = weights.view(-1)
+
+                # Compute per-sample loss and apply weights
+                per_sample_loss = self.criterion(
+                    logits.view(-1), batch_targets.view(-1)
+                )
+                if per_sample_loss.dim() == 0:
+                    # Criterion returns mean, need to recompute
+                    import torch.nn.functional as F
+
+                    per_sample_loss = F.binary_cross_entropy_with_logits(
+                        logits.view(-1), batch_targets.view(-1), reduction="none"
+                    )
+                loss = (per_sample_loss * weights).mean()
+            else:
+                # Standard loss without weighting
+                loss = self.criterion(logits.view(-1), batch_targets.view(-1))
 
             self.optimizer.zero_grad()
             loss.backward()
-
-            if self.config.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.grad_clip_norm,
-                )
-
+            torch.nn.utils.clip_grad_norm_(
+                list(self.encoder.parameters()) + list(self.decoder.parameters()),
+                self.config.grad_clip_norm,
+            )
             self.optimizer.step()
-            self.train_metrics.update(logits, labels, loss.item())
+
+            total_loss += loss.item()
+            num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        return self.train_metrics.compute()
+        return total_loss / num_batches
 
     @torch.no_grad()
-    def validate(self, tune_threshold: bool = True) -> ClassificationMetrics:
-        """
-        Validate model using autoregressive inference.
+    def validate(self) -> ClassificationMetrics:
+        """Validate on test timesteps."""
+        self.encoder.eval()
+        self.decoder.eval()
 
-        Args:
-            tune_threshold: Whether to find optimal classification threshold
-
-        Returns:
-            ClassificationMetrics for the validation set
-        """
-        self.model.eval()
-        self.val_metrics.reset()
-
-        # Collect all predictions for threshold tuning
-        all_logits = []
-        all_labels = []
-
-        # Initialize model with training history
-        self.model.reset_inference_state()
-        self.model.init_from_train_history(
-            graph_dict=self.data_module.graph_dict,
-            entity_history=self.data_module.entity_history,
-            entity_history_t=self.data_module.entity_history_t,
-            global_emb=self.global_emb,
-            global_model=self.global_model,
+        # Use train+val context for test evaluation
+        context_graph_dict, context_history, context_history_t = (
+            self.data_module.get_train_val_context()
         )
 
-        # Get validation timesteps
-        timesteps = sorted(self.data_module.val_dataset.unique_timesteps)
+        entity_context = self.encoder(
+            context_graph_dict, context_history, context_history_t
+        )
 
-        pbar = tqdm(timesteps, desc="Validation")
+        # Get test targets
+        target_matrix = self._get_target_matrix(self.test_timesteps, "test").to(
+            self.device
+        )
 
-        for t in pbar:
-            # Get ALL known pairs with ground truth labels
-            pairs, labels_np = self.data_module.get_history_pairs_for_timestep(
-                t, split="valid"
+        # Relative timesteps (from train boundary)
+        relative_t = torch.tensor(
+            [t - self.train_max_time for t in self.test_timesteps],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Get edge history for validation if decoder uses it
+        val_edge_history = None
+        if self.decoder.use_edge_history:
+            # For validation on test set, we use history from train data
+            val_edge_history = self._get_edge_history().to(self.device)
+
+        # Predict all at once (in batches for memory)
+        all_logits = []
+        pair_batch_size = 512
+
+        for start_idx in range(0, len(self.known_pairs), pair_batch_size):
+            end_idx = min(start_idx + pair_batch_size, len(self.known_pairs))
+            batch_pairs = self.known_pairs[start_idx:end_idx].to(self.device)
+            batch_edge_history = None
+            if val_edge_history is not None:
+                batch_edge_history = val_edge_history[start_idx:end_idx]
+            logits = self.decoder(
+                entity_context, batch_pairs, relative_t, edge_history=batch_edge_history
             )
+            all_logits.append(logits.cpu())
 
-            # Process in batches
-            batch_size = 128
-            for i in range(0, len(pairs), batch_size):
-                batch_pairs = pairs[i : i + batch_size]
-                batch_labels = labels_np[i : i + batch_size]
+        all_logits = torch.cat(all_logits, dim=0)  # (num_pairs, num_timesteps)
 
-                entity1 = torch.LongTensor(batch_pairs[:, 0]).to(self.device)
-                entity2 = torch.LongTensor(batch_pairs[:, 1]).to(self.device)
-                labels = torch.FloatTensor(batch_labels).to(self.device)
+        # Flatten for metrics
+        logits_flat = all_logits.view(-1)
+        targets_flat = target_matrix.view(-1).cpu()
 
-                probs, preds = self.model.predict_batch(
-                    entity1_ids=entity1,
-                    entity2_ids=entity2,
-                    timestep=t,
-                    threshold=self.optimal_threshold,
-                    update_history=True,
-                )
-
-                # Convert probs to logits for metrics
-                probs_clamped = probs.clamp(1e-7, 1 - 1e-7)
-                logits = torch.log(probs_clamped / (1 - probs_clamped))
-
-                loss = self.criterion(logits, labels)
-                self.val_metrics.update(logits, labels, loss.item())
-
-                all_logits.append(logits.cpu())
-                all_labels.append(labels.cpu())
-
-        # Compute metrics
-        metrics = self.val_metrics.compute(tune_threshold=tune_threshold)
-
-        if tune_threshold and all_logits:
-            # Find optimal threshold on validation predictions
-            all_logits_cat = torch.cat(all_logits)
-            all_labels_cat = torch.cat(all_labels)
-            self.optimal_threshold = find_optimal_threshold(
-                all_logits_cat, all_labels_cat
-            )
-            metrics.threshold = self.optimal_threshold
-
-        return metrics
+        metrics_computer = MetricsComputer()
+        metrics_computer.update(logits_flat, targets_flat)
+        return metrics_computer.compute(tune_threshold=True)
 
     def train(self) -> Dict[str, Any]:
-        """
-        Full training loop.
-
-        Returns:
-            Training history and final metrics
-        """
+        """Full training loop."""
         print(f"\n{'=' * 60}")
-        print("Starting training")
+        print("Training Encoder-Decoder Model")
         print(f"{'=' * 60}")
-        print(f"Entities: {self.data_module.num_entities}")
-        print(f"Relations: {self.data_module.num_rels}")
-        print(f"Device: {self.device}")
+        print(f"  Known pairs: {len(self.known_pairs)}")
+        print(f"  Val timesteps: {len(self.val_timesteps)}")
+        print(f"  Test timesteps: {len(self.test_timesteps)}")
+        print(f"  Encoder frozen: {self.config.freeze_encoder}")
         print(f"{'=' * 60}\n")
 
         for epoch in range(1, self.config.max_epochs + 1):
-            # Train
-            train_metrics = self.train_epoch(epoch)
+            train_loss = self.train_epoch(epoch)
+            self.history["train_loss"].append(train_loss)
 
-            # Validate
             if epoch % self.config.eval_interval == 0:
-                val_metrics = self.validate(tune_threshold=True)
+                val_metrics = self.validate()
+                self.history["val_auprc"].append(val_metrics.auprc)
+                self.history["val_f1"].append(val_metrics.f1)
 
-                # Log metrics
-                self._log_metrics(epoch, train_metrics, val_metrics)
+                print(
+                    f"Epoch {epoch:03d} | Loss: {train_loss:.4f} | "
+                    f"{val_metrics.short_str()}"
+                )
 
-                # Check for improvement
                 if val_metrics.auprc > self.best_val_auprc:
                     self.best_val_auprc = val_metrics.auprc
                     self.best_epoch = epoch
+                    self.optimal_threshold = val_metrics.threshold
                     self.patience_counter = 0
                     self._save_checkpoint(epoch, val_metrics, is_best=True)
                 else:
                     self.patience_counter += 1
 
-                # Early stopping
                 if self.patience_counter >= self.config.patience:
                     print(f"\nEarly stopping at epoch {epoch}")
-                    print(
-                        f"Best epoch: {self.best_epoch} with AUPRC: {self.best_val_auprc:.4f}"
-                    )
                     break
 
-            # Update history
-            self.history["train_loss"].append(train_metrics.loss)
-            self.history["train_auprc"].append(train_metrics.auprc)
-            self.history["train_auroc"].append(train_metrics.auroc)
-            self.history["train_f1"].append(train_metrics.f1)
-
-            if epoch % self.config.eval_interval == 0:
-                self.history["val_loss"].append(val_metrics.loss)
-                self.history["val_auprc"].append(val_metrics.auprc)
-                self.history["val_auroc"].append(val_metrics.auroc)
-                self.history["val_f1"].append(val_metrics.f1)
-
-        # Save final checkpoint
-        self._save_checkpoint(epoch, val_metrics, is_best=False)
-
-        # Save history
         self._save_history()
 
         return {
@@ -282,64 +397,34 @@ class Trainer:
             "optimal_threshold": self.optimal_threshold,
         }
 
-    def _log_metrics(
-        self,
-        epoch: int,
-        train_metrics: ClassificationMetrics,
-        val_metrics: ClassificationMetrics,
-    ) -> None:
-        """Log metrics to console."""
-        print(f"\nEpoch {epoch:03d}")
-        print(f"  Train: {train_metrics.short_str()}")
-        print(f"  Val:   {val_metrics.short_str()}")
-        print(f"  Threshold: {self.optimal_threshold:.3f}")
-
     def _save_checkpoint(
-        self, epoch: int, metrics: ClassificationMetrics, is_best: bool = False
-    ) -> None:
+        self, epoch: int, metrics: ClassificationMetrics, is_best: bool
+    ):
         """Save model checkpoint."""
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+            "encoder_state_dict": self.encoder.rapid.state_dict(),
+            "decoder_state_dict": self.decoder.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "metrics": metrics.to_dict(),
+            "optimal_threshold": metrics.threshold,
             "config": {
-                "training": {
-                    "learning_rate": self.config.learning_rate,
-                    "max_epochs": self.config.max_epochs,
-                    "patience": self.config.patience,
-                    "focal_gamma": self.config.focal_gamma,
-                },
-                "model": {
-                    "hidden_dim": self.model.hidden_dim,
-                    "seq_len": self.model.seq_len,
-                },
-                "node_features": {
-                    "enabled": self.model.use_node_features,
-                    "use_physicochemical": getattr(
-                        self.model.config.node_features, "use_physicochemical", True
-                    ),
-                    "use_intrachain": getattr(
-                        self.model.config.node_features, "use_intrachain", True
-                    ),
+                "hidden_dim": self.encoder.hidden_dim,
+                "num_entities": self.encoder.num_entities,
+                "decoder": {
+                    "num_layers": self.decoder.num_layers,
+                    "max_timesteps": self.decoder.max_timesteps,
+                    "use_edge_history": self.decoder.use_edge_history,
                 },
             },
-            "metrics": metrics.to_dict(),
-            "optimal_threshold": self.optimal_threshold,
-            "best_val_auprc": self.best_val_auprc,
         }
 
-        # Save latest
-        latest_path = self.checkpoint_dir / "latest.pth"
-        torch.save(checkpoint, latest_path)
-
-        # Save best
+        torch.save(checkpoint, self.checkpoint_dir / "latest.pth")
         if is_best:
-            best_path = self.checkpoint_dir / "best.pth"
-            torch.save(checkpoint, best_path)
-            print(f"  ✓ New best model saved (AUPRC: {metrics.auprc:.4f})")
+            torch.save(checkpoint, self.checkpoint_dir / "best.pth")
+            print(f"  ✓ New best model (AUPRC: {metrics.auprc:.4f})")
 
-    def _save_history(self) -> None:
+    def _save_history(self):
         """Save training history."""
-        history_path = self.log_dir / "history.json"
-        with open(history_path, "w") as f:
+        with open(self.log_dir / "history.json", "w") as f:
             json.dump(self.history, f, indent=2)

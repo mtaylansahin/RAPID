@@ -1,25 +1,22 @@
 #!/usr/bin/env python
 """
-RAPID: A Recurrent Architecture for Predicting Protein Interaction Dynamics
+RAPID: Encoder-Decoder Architecture for Predicting Protein Interaction Dynamics
 
 This script orchestrates all functionality:
-- pretrain: Train the global RGCN model
-- train: Train the main RAPID model
-- evaluate: Evaluate a trained model
+- pretrain: Train the encoder on link prediction
+- train: Train the decoder on validation timesteps
+- evaluate: Evaluate the encoder-decoder model
 - all: Run full pipeline (pretrain -> train -> evaluate)
 
 Examples:
     # Full pipeline
-    uv run python main.py all --dataset RAPID --epochs 100
+    uv run python main.py all --dataset RAPID --epochs 50
 
-    # Pretrain global model only
-    uv run python main.py pretrain --dataset RAPID --epochs 30
+    # Pretrain encoder only
+    uv run python main.py pretrain --dataset RAPID --pretrain_epochs 30
 
-    # Train with global model
-    uv run python main.py train --dataset RAPID --use_global_model --epochs 100
-
-    # Train without global model
-    uv run python main.py train --dataset RAPID --epochs 100
+    # Train decoder (requires pretrained encoder)
+    uv run python main.py train --dataset RAPID --epochs 50 --encoder_path ./models/RAPID/encoder.pth
 
     # Evaluate
     uv run python main.py evaluate --checkpoint ./checkpoints/RAPID_*/best.pth
@@ -29,22 +26,22 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 # Internal imports
-from src.config import ModelConfig, NodeFeatureConfig, TrainingConfig
+from src.config import DecoderConfig, ModelConfig, NodeFeatureConfig, TrainingConfig
 from src.data.dataset import PPIDataModule
-from src.data.preprocessing import PreprocessingConfig, run_preprocessing
 from src.data.node_features import compute_node_features
+from src.data.preprocessing import PreprocessingConfig, run_preprocessing
 from src.evaluate import Evaluator
 from src.analysis import AnalysisConfig, ResultsManager
-from src.models.global_model import create_global_model
+from src.models.decoder import TemporalEdgeDecoder, create_decoder
+from src.models.encoder import RAPIDEncoder
 from src.models.rapid import create_model
-from src.pretrain import train_global_model
+from src.pretrain import pretrain_encoder
 from src.train import Trainer
 
 # Constants
@@ -59,7 +56,6 @@ def get_base_args():
     """Get argument parser with common arguments."""
     parser = argparse.ArgumentParser(add_help=False)
 
-    # Common arguments
     parser.add_argument(
         "--dataset", type=str, default="RAPID", help="Dataset name (folder in data/)"
     )
@@ -77,13 +73,11 @@ def get_base_args():
 
 def setup_env(args) -> torch.device:
     """Set random seeds and setup compute device."""
-    # Set random seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if args.gpu >= 0 and torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Setup device
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
         device = torch.device(f"cuda:{args.gpu}")
@@ -93,46 +87,43 @@ def setup_env(args) -> torch.device:
     return device
 
 
-def load_global_model(
-    path: Union[str, Path],
+def load_encoder(
+    path: Path,
     num_entities: int,
     num_rels: int,
+    hidden_dim: int,
     device: torch.device,
-    default_hidden_dim: int = 200,
-    default_seq_len: int = 10,
-) -> nn.Module:
-    """Load a pretrained global RGCN model from checkpoint."""
-    path = Path(path)
-    if not path.exists():
-        print(f"\nWarning: Global model path not found: {path}")
-        return None
-
-    print(f"\nLoading global model from: {path}")
+    node_features: Optional[torch.Tensor] = None,
+    freeze: bool = True,
+) -> RAPIDEncoder:
+    """Load a pretrained encoder from checkpoint."""
+    print(f"\nLoading encoder from: {path}")
     checkpoint = torch.load(path, map_location=device)
 
-    gm_config = checkpoint.get("config", {})
+    # Create model config
+    model_config = ModelConfig(hidden_dim=hidden_dim)
 
-    model = create_global_model(
+    # Create underlying RAPID model
+    rapid_model = create_model(
         num_entities=num_entities,
         num_rels=num_rels,
-        hidden_dim=gm_config.get("hidden_dim", default_hidden_dim),
-        num_bases=gm_config.get("num_bases", 5),
-        seq_len=gm_config.get("seq_len", default_seq_len),
-        pooling=gm_config.get("pooling", "max"),
+        config=model_config,
+        node_features=node_features,
     )
+    rapid_model.load_state_dict(checkpoint["model_state_dict"])
 
-    model.load_state_dict(checkpoint["state_dict"])
-    model.global_emb = checkpoint.get("global_emb", {})
-    model = model.to(device)
+    # Wrap in encoder
+    encoder = RAPIDEncoder(rapid_model, freeze=freeze)
+    encoder = encoder.to(device)
 
-    print(f"  Global embeddings loaded for {len(model.global_emb)} timesteps")
-    return model
+    print(f"  Encoder loaded (frozen: {freeze})")
+    return encoder
 
 
 def run_pretrain(args) -> Path:
-    """Run global model pretraining."""
+    """Run encoder pretraining."""
     print("\n" + "=" * 60)
-    print("Stage 1: Pretraining Global Model")
+    print("Stage 1: Pretraining Encoder")
     print("=" * 60)
 
     device = setup_env(args)
@@ -147,71 +138,11 @@ def run_pretrain(args) -> Path:
         seed=args.seed,
     )
 
-    # Create global model
-    print("\nCreating global RGCN model...")
-    model = create_global_model(
-        num_entities=data_module.num_entities,
-        num_rels=data_module.num_rels,
-        hidden_dim=args.hidden_dim,
-        num_bases=args.num_bases,
-        seq_len=args.seq_len,
-        pooling=args.pooling,
-    )
-    model = model.to(device)
-
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Train
-    output_dir = MODELS_DIR / args.dataset
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{args.pooling}_global.pth"
-
-    train_global_model(
-        model=model,
-        data_module=data_module,
-        device=device,
-        epochs=args.pretrain_epochs,
-        lr=args.pretrain_lr,
-        output_path=output_path,
-    )
-
-    return output_path
-
-
-def run_train(args) -> Path:
-    """Run main model training."""
-    print("\n" + "=" * 60)
-    print("Stage 2: Training Main Model")
-    print("=" * 60)
-
-    device = setup_env(args)
-
-    # Create configs
+    # Create model config
     model_config = ModelConfig(
         hidden_dim=args.hidden_dim,
         seq_len=args.seq_len,
         dropout=args.dropout,
-    )
-
-    training_config = TrainingConfig(
-        learning_rate=args.lr,
-        max_epochs=args.epochs,
-        patience=args.patience,
-        focal_gamma=args.focal_gamma,
-    )
-
-    # Setup paths
-    checkpoint_dir = CHECKPOINTS_DIR / args.experiment_name
-    log_dir = LOGS_DIR / args.experiment_name
-
-    # Load data
-    print(f"\nLoading dataset: {args.dataset}")
-    data_module = PPIDataModule(
-        data_path=DATA_DIR / args.dataset,
-        batch_size=args.batch_size,
-        neg_ratio=args.neg_ratio,
-        hard_ratio=args.hard_ratio,
-        seed=args.seed,
     )
 
     # Compute node features if enabled
@@ -223,7 +154,6 @@ def run_train(args) -> Path:
             use_physicochemical=not getattr(args, "no_physicochemical", False),
             use_intrachain=not getattr(args, "no_intrachain_features", False),
         )
-        # Get train cutoff for data leakage prevention
         train_cutoff = data_module.train_max_time
         node_features = compute_node_features(
             config=node_feature_config,
@@ -237,45 +167,123 @@ def run_train(args) -> Path:
         print("\nNode features disabled.")
         model_config.node_features = NodeFeatureConfig(enabled=False)
 
-    # Create model
-    print("\nCreating model...")
+    # Create RAPID model for pretraining
+    print("\nCreating encoder model...")
     model = create_model(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
         config=model_config,
         node_features=node_features,
     )
-
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Load global model if specified
-    global_model = None
-    if args.use_global_model:
-        if args.global_model_path:
-            global_model_path = Path(args.global_model_path)
-        else:
-            global_model_path = MODELS_DIR / args.dataset / "max_global.pth"
+    # Output path
+    output_dir = MODELS_DIR / args.dataset
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "encoder.pth"
 
-        global_model = load_global_model(
-            path=global_model_path,
-            num_entities=data_module.num_entities,
-            num_rels=data_module.num_rels,
-            device=device,
-            default_hidden_dim=args.hidden_dim,
-            default_seq_len=args.seq_len,
+    # Train
+    pretrain_encoder(
+        model=model,
+        data_module=data_module,
+        device=device,
+        epochs=args.pretrain_epochs,
+        lr=args.pretrain_lr,
+        output_path=output_path,
+        patience=5,
+        focal_gamma=args.focal_gamma if hasattr(args, "focal_gamma") else 2.0,
+    )
+
+    return output_path
+
+
+def run_train(args) -> Path:
+    """Train decoder model."""
+    print("\n" + "=" * 60)
+    print("Stage 2: Training Decoder")
+    print("=" * 60)
+
+    device = setup_env(args)
+
+    # Load data
+    print(f"\nLoading dataset: {args.dataset}")
+    data_module = PPIDataModule(
+        data_path=DATA_DIR / args.dataset,
+        batch_size=args.batch_size,
+        neg_ratio=args.neg_ratio,
+        hard_ratio=args.hard_ratio,
+        seed=args.seed,
+    )
+
+    # Compute node features if needed
+    node_features = None
+    if not getattr(args, "no_node_features", False):
+        print("\nComputing node features...")
+        node_feature_config = NodeFeatureConfig(enabled=True)
+        train_cutoff = data_module.train_max_time
+        node_features = compute_node_features(
+            config=node_feature_config,
+            data_dir=DATA_DIR / args.dataset,
+            train_cutoff=train_cutoff,
         )
-        if global_model is None:
-            print("  Training without global model.")
+
+    # Load pretrained encoder
+    encoder_path = (
+        Path(args.encoder_path)
+        if args.encoder_path
+        else MODELS_DIR / args.dataset / "encoder.pth"
+    )
+    if not encoder_path.exists():
+        print(f"Error: Encoder not found at {encoder_path}")
+        print("Run 'pretrain' first or specify --encoder_path")
+        sys.exit(1)
+
+    encoder = load_encoder(
+        path=encoder_path,
+        num_entities=data_module.num_entities,
+        num_rels=data_module.num_rels,
+        hidden_dim=args.hidden_dim,
+        device=device,
+        node_features=node_features,
+        freeze=args.freeze_encoder,
+    )
+
+    # Create decoder
+    print("\nCreating decoder...")
+    decoder = create_decoder(
+        hidden_dim=args.hidden_dim,
+        num_layers=args.decoder_layers,
+        num_heads=args.decoder_heads,
+        max_timesteps=200,
+        dropout=args.dropout,
+        use_edge_history=getattr(args, "use_edge_history", False),
+    )
+    print(f"Decoder parameters: {sum(p.numel() for p in decoder.parameters()):,}")
+
+    # Create training config
+    training_config = TrainingConfig(
+        learning_rate=args.lr,
+        max_epochs=args.epochs,
+        patience=args.patience,
+        focal_gamma=args.focal_gamma,
+        freeze_encoder=args.freeze_encoder,
+        encoder_lr=args.encoder_lr if not args.freeze_encoder else 0.0,
+        transition_weight=getattr(args, "transition_weight", 1.0),
+    )
+
+    # Setup paths
+    checkpoint_dir = CHECKPOINTS_DIR / args.experiment_name
+    log_dir = LOGS_DIR / args.experiment_name
 
     # Create trainer
     trainer = Trainer(
-        model=model,
+        encoder=encoder,
+        decoder=decoder,
         data_module=data_module,
         config=training_config,
         device=device,
         checkpoint_dir=checkpoint_dir,
         log_dir=log_dir,
-        global_model=global_model,
     )
 
     # Train
@@ -295,7 +303,7 @@ def run_evaluate(args) -> bool:
     print("Stage 3: Evaluation")
     print("=" * 60)
 
-    # Find checkpoint if not specified
+    # Find checkpoint
     checkpoint_path = args.checkpoint
     if not checkpoint_path:
         if CHECKPOINTS_DIR.exists():
@@ -324,87 +332,62 @@ def run_evaluate(args) -> bool:
         neg_ratio=1.0,
     )
 
-    # Load model
+    # Load checkpoint
     print(f"\nLoading model from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    if "config" in checkpoint and "model" in checkpoint["config"]:
-        model_config = ModelConfig(**checkpoint["config"]["model"])
-    else:
-        model_config = ModelConfig()
+    # Get config from checkpoint
+    hidden_dim = checkpoint.get("config", {}).get("hidden_dim", args.hidden_dim)
+    decoder_config = checkpoint.get("config", {}).get("decoder", {})
 
-    # Check if model was trained with node features (from checkpoint)
-    node_features_enabled = False
-    use_physicochemical = True
-    use_intrachain = True
-    if "config" in checkpoint and "node_features" in checkpoint["config"]:
-        nf_config = checkpoint["config"]["node_features"]
-        node_features_enabled = nf_config.get("enabled", False)
-        use_physicochemical = nf_config.get("use_physicochemical", True)
-        use_intrachain = nf_config.get("use_intrachain", True)
-
-    # Override model config with checkpoint values
-    model_config.node_features = NodeFeatureConfig(
-        enabled=node_features_enabled,
-        use_physicochemical=use_physicochemical,
-        use_intrachain=use_intrachain,
-    )
-
-    # Compute node features if model was trained with them
+    # Compute node features
     node_features = None
-    if node_features_enabled:
+    if not getattr(args, "no_node_features", False):
         print("\nComputing node features...")
-        print(f"  Physicochemical: {use_physicochemical}, Intrachain: {use_intrachain}")
+        node_feature_config = NodeFeatureConfig(enabled=True)
         train_cutoff = data_module.train_max_time
         node_features = compute_node_features(
-            config=model_config.node_features,
+            config=node_feature_config,
             data_dir=DATA_DIR / args.dataset,
             train_cutoff=train_cutoff,
         )
-        if node_features is not None:
-            print(f"  Node features shape: {node_features.shape}")
-    else:
-        print("\nNode features: disabled (model trained without)")
 
-    model = create_model(
+    # Create encoder
+    model_config = ModelConfig(hidden_dim=hidden_dim)
+    rapid_model = create_model(
         num_entities=data_module.num_entities,
         num_rels=data_module.num_rels,
         config=model_config,
         node_features=node_features,
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    rapid_model.load_state_dict(checkpoint["encoder_state_dict"])
+    encoder = RAPIDEncoder(rapid_model, freeze=True)
 
-    # Get threshold (from checkpoint)
+    # Create decoder
+    decoder = create_decoder(
+        hidden_dim=hidden_dim,
+        num_layers=decoder_config.get("num_layers", 4),
+        num_heads=8,
+        max_timesteps=decoder_config.get("max_timesteps", 200),
+        dropout=0.1,
+        use_edge_history=decoder_config.get("use_edge_history", False),
+    )
+    decoder.load_state_dict(checkpoint["decoder_state_dict"])
+
+    # Get threshold
     threshold = checkpoint.get("optimal_threshold", 0.5)
     print(f"Using threshold: {threshold:.3f}")
 
-    # Load global model if specified
-    global_model = None
-    if args.use_global_model:
-        if args.global_model_path:
-            global_model_path = Path(args.global_model_path)
-        else:
-            global_model_path = MODELS_DIR / args.dataset / "max_global.pth"
-
-        global_model = load_global_model(
-            path=global_model_path,
-            num_entities=data_module.num_entities,
-            num_rels=data_module.num_rels,
-            device=device,
-            default_hidden_dim=200,  # Default for evaluation if config missing
-            default_seq_len=10,
-        )
-
     # Create evaluator
     evaluator = Evaluator(
-        model=model,
+        encoder=encoder,
+        decoder=decoder,
         data_module=data_module,
         device=device,
         threshold=threshold,
-        global_model=global_model,
     )
 
-    # Prepare predictions directory for analysis + optional saving
+    # Predictions directory
     predictions_dir = Path(args.predictions_dir) / args.dataset
     predictions_path = predictions_dir / "predictions.txt"
 
@@ -412,7 +395,7 @@ def run_evaluate(args) -> bool:
     evaluator.full_evaluation()
     evaluator.save_predictions(predictions_path)
 
-    # Run analysis + visualization outputs
+    # Run analysis + visualization
     analysis_output_dir = Path("analysis_outputs") / Path(checkpoint_path).parent.name
     analysis_config = AnalysisConfig(
         input_directory=str(data_path),
@@ -431,9 +414,8 @@ def run_evaluate(args) -> bool:
 
 def main():
     """Main entry point."""
-    # Create main parser
     parser = argparse.ArgumentParser(
-        description="RAPID: A Recurrent Architecture for Predicting Protein Interaction Dynamics",
+        description="RAPID: Encoder-Decoder for Protein Interaction Dynamics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -443,7 +425,7 @@ def main():
     # === Pretrain command ===
     pretrain_parser = subparsers.add_parser(
         "pretrain",
-        help="Pretrain global RGCN model",
+        help="Pretrain encoder on link prediction",
         parents=[get_base_args()],
     )
     pretrain_parser.add_argument(
@@ -453,72 +435,78 @@ def main():
         "--pretrain_lr", type=float, default=1e-3, help="Pretraining learning rate"
     )
     pretrain_parser.add_argument(
-        "--batch_size", type=int, default=64, help="Batch size"
+        "--batch_size", type=int, default=128, help="Batch size"
     )
     pretrain_parser.add_argument(
-        "--pooling",
-        type=str,
-        default="max",
-        choices=["max", "mean"],
-        help="Graph pooling method",
+        "--focal_gamma", type=float, default=2.0, help="Focal loss gamma"
+    )
+    pretrain_parser.add_argument(
+        "--no_node_features", action="store_true", help="Disable node features"
     )
 
     # === Train command ===
     train_parser = subparsers.add_parser(
         "train",
-        help="Train main PPI dynamics model",
+        help="Train decoder model",
         parents=[get_base_args()],
     )
+    train_parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     train_parser.add_argument(
-        "--epochs", type=int, default=100, help="Maximum training epochs"
+        "--lr", type=float, default=1e-3, help="Decoder learning rate"
     )
-    train_parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    train_parser.add_argument(
+        "--encoder_lr", type=float, default=1e-5, help="Encoder fine-tuning LR"
+    )
     train_parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     train_parser.add_argument(
-        "--neg_ratio", type=float, default=1.0, help="Negative sampling ratio"
+        "--neg_ratio", type=float, default=1.0, help="Negative ratio"
     )
     train_parser.add_argument(
-        "--hard_ratio",
-        type=float,
-        default=0.5,
-        help="Hard negative ratio (history constrained)",
+        "--hard_ratio", type=float, default=0.5, help="Hard negative ratio"
     )
     train_parser.add_argument(
         "--focal_gamma", type=float, default=2.0, help="Focal loss gamma"
     )
     train_parser.add_argument(
+        "--transition_weight",
+        type=float,
+        default=1.0,
+        help="Weight multiplier for transitions vs persistence in loss",
+    )
+    train_parser.add_argument(
         "--patience", type=int, default=10, help="Early stopping patience"
     )
     train_parser.add_argument(
-        "--use_global_model", action="store_true", help="Use pretrained global model"
+        "--encoder_path", type=str, default=None, help="Path to pretrained encoder"
     )
     train_parser.add_argument(
-        "--global_model_path",
-        type=str,
-        default=None,
-        help="Path to global model checkpoint",
-    )
-    train_parser.add_argument(
-        "--experiment_name",
-        type=str,
-        default=None,
-        help="Experiment name for checkpoints",
-    )
-    # Node feature flags
-    train_parser.add_argument(
-        "--no_node_features",
+        "--freeze_encoder",
         action="store_true",
-        help="Disable all node features",
+        default=True,
+        help="Freeze encoder weights",
     )
     train_parser.add_argument(
-        "--no_physicochemical",
-        action="store_true",
-        help="Disable physicochemical features (only use intrachain)",
+        "--fine_tune_encoder",
+        dest="freeze_encoder",
+        action="store_false",
+        help="Fine-tune encoder with lower LR",
     )
     train_parser.add_argument(
-        "--no_intrachain_features",
+        "--decoder_layers", type=int, default=4, help="Number of decoder layers"
+    )
+    train_parser.add_argument(
+        "--decoder_heads", type=int, default=8, help="Number of decoder attention heads"
+    )
+    train_parser.add_argument(
+        "--experiment_name", type=str, default=None, help="Experiment name"
+    )
+    train_parser.add_argument(
+        "--no_node_features", action="store_true", help="Disable node features"
+    )
+    train_parser.add_argument(
+        "--use_edge_history",
         action="store_true",
-        help="Disable intrachain features (only use physicochemical)",
+        help="Enable Transformer-based edge history encoder (uses full history)",
     )
 
     # === Evaluate command ===
@@ -528,159 +516,69 @@ def main():
         parents=[get_base_args()],
     )
     eval_parser.add_argument(
-        "--checkpoint", type=str, default=None, help="Path to model checkpoint"
+        "--checkpoint", type=str, default=None, help="Checkpoint path"
     )
-    eval_parser.add_argument(
-        "--use_global_model", action="store_true", help="Use pretrained global model"
-    )
-    eval_parser.add_argument(
-        "--global_model_path",
-        type=str,
-        default=None,
-        help="Path to global model checkpoint",
-    )
-    # Prediction output options
     eval_parser.add_argument(
         "--predictions_dir",
         type=str,
-        default=PREDICTIONS_DIR,
-        help="Directory to save prediction files",
+        default=str(PREDICTIONS_DIR),
+        help="Predictions dir",
+    )
+    eval_parser.add_argument(
+        "--no_node_features", action="store_true", help="Disable node features"
     )
 
-    # === All command (full pipeline) ===
+    # === All command ===
     all_parser = subparsers.add_parser(
         "all",
-        help="Run full pipeline: preprocess -> pretrain (optional) -> train -> evaluate",
+        help="Run full pipeline: pretrain -> train -> evaluate",
         parents=[get_base_args()],
-    )
-    # Preprocess args
-    all_parser.add_argument(
-        "--data_dir",
-        type=str,
-        default=None,
-        help="Raw data directory with .interfacea files (optional, skip if data preprocessed)",
-    )
-    all_parser.add_argument(
-        "--replica",
-        type=str,
-        default=None,
-        help="Replica name for preprocessing (e.g., replica1)",
-    )
-    all_parser.add_argument(
-        "--test_ratio",
-        type=float,
-        default=0.2,
-        help="Test/validation ratio for preprocessing (default: 0.2)",
     )
     # Pretrain args
     all_parser.add_argument(
-        "--pretrain_epochs", type=int, default=30, help="Number of pretraining epochs"
+        "--pretrain_epochs", type=int, default=30, help="Pretrain epochs"
     )
     all_parser.add_argument(
-        "--pretrain_lr", type=float, default=1e-3, help="Pretraining learning rate"
-    )
-    all_parser.add_argument(
-        "--pooling",
-        type=str,
-        default="max",
-        choices=["max", "mean"],
-        help="Graph pooling method",
+        "--pretrain_lr", type=float, default=1e-3, help="Pretrain LR"
     )
     # Train args
-    all_parser.add_argument(
-        "--epochs", type=int, default=100, help="Maximum training epochs"
-    )
+    all_parser.add_argument("--epochs", type=int, default=50, help="Train epochs")
     all_parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    all_parser.add_argument("--encoder_lr", type=float, default=1e-5, help="Encoder LR")
     all_parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     all_parser.add_argument(
-        "--neg_ratio", type=float, default=1.0, help="Negative sampling ratio"
+        "--neg_ratio", type=float, default=1.0, help="Negative ratio"
     )
+    all_parser.add_argument("--hard_ratio", type=float, default=0.5, help="Hard ratio")
     all_parser.add_argument(
-        "--hard_ratio",
-        type=float,
-        default=0.5,
-        help="Hard negative ratio (history constrained)",
+        "--focal_gamma", type=float, default=2.0, help="Focal gamma"
     )
+    all_parser.add_argument("--patience", type=int, default=10, help="Patience")
+    all_parser.add_argument("--freeze_encoder", action="store_true", default=True)
     all_parser.add_argument(
-        "--focal_gamma", type=float, default=2.0, help="Focal loss gamma"
+        "--fine_tune_encoder", dest="freeze_encoder", action="store_false"
     )
-    all_parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience"
-    )
-    all_parser.add_argument(
-        "--use_global_model", action="store_true", help="Use pretrained global model"
-    )
-    all_parser.add_argument(
-        "--global_model_path",
-        type=str,
-        default=None,
-        help="Path to global model checkpoint",
-    )
-    all_parser.add_argument(
-        "--experiment_name",
-        type=str,
-        default=None,
-        help="Experiment name for checkpoints",
-    )
-    all_parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to model checkpoint (for evaluate only)",
-    )
-    # Prediction output options
-    all_parser.add_argument(
-        "--predictions_dir",
-        type=str,
-        default=PREDICTIONS_DIR,
-        help="Directory to save prediction files",
-    )
-    # Node feature flags
-    all_parser.add_argument(
-        "--no_node_features",
-        action="store_true",
-        help="Disable all node features",
-    )
-    all_parser.add_argument(
-        "--no_physicochemical",
-        action="store_true",
-        help="Disable physicochemical features (only use intrachain)",
-    )
-    all_parser.add_argument(
-        "--no_intrachain_features",
-        action="store_true",
-        help="Disable intrachain features (only use physicochemical)",
-    )
+    all_parser.add_argument("--decoder_layers", type=int, default=4)
+    all_parser.add_argument("--decoder_heads", type=int, default=8)
+    all_parser.add_argument("--encoder_path", type=str, default=None)
+    all_parser.add_argument("--experiment_name", type=str, default=None)
+    all_parser.add_argument("--predictions_dir", type=str, default=str(PREDICTIONS_DIR))
+    all_parser.add_argument("--checkpoint", type=str, default=None)
+    all_parser.add_argument("--no_node_features", action="store_true")
+    # Preprocess args
+    all_parser.add_argument("--data_dir", type=str, default=None)
+    all_parser.add_argument("--replica", type=str, default=None)
+    all_parser.add_argument("--test_ratio", type=float, default=0.2)
 
     # === Preprocess command ===
     preprocess_parser = subparsers.add_parser(
         "preprocess",
-        help="Preprocess raw MD simulation data into RAPID format",
+        help="Preprocess raw MD simulation data",
     )
-    preprocess_parser.add_argument(
-        "--data_dir",
-        type=str,
-        required=True,
-        help="Directory containing replica folders with .interfacea files",
-    )
-    preprocess_parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Output directory for processed data files",
-    )
-    preprocess_parser.add_argument(
-        "--replica",
-        type=str,
-        required=True,
-        help="Replica name (e.g., replica1)",
-    )
-    preprocess_parser.add_argument(
-        "--test_ratio",
-        type=float,
-        default=0.2,
-        help="Fraction of timeline for test set; validation uses same ratio (default: 0.2)",
-    )
+    preprocess_parser.add_argument("--data_dir", type=str, required=True)
+    preprocess_parser.add_argument("--output_dir", type=str, required=True)
+    preprocess_parser.add_argument("--replica", type=str, required=True)
+    preprocess_parser.add_argument("--test_ratio", type=float, default=0.2)
 
     args = parser.parse_args()
 
@@ -689,7 +587,7 @@ def main():
         sys.exit(0)
 
     print("\n" + "=" * 60)
-    print("RAPID: Recurrent Architecture for Predicting Protein Interaction Dynamics")
+    print("RAPID: Encoder-Decoder for Protein Interaction Dynamics")
     print("=" * 60)
     print(f"Command: {args.command}")
     if args.command != "preprocess":
@@ -702,7 +600,6 @@ def main():
         run_pretrain(args)
 
     elif args.command == "train":
-        # Setup experiment name
         if args.experiment_name is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             args.experiment_name = f"{args.dataset}_{timestamp}"
@@ -718,9 +615,7 @@ def main():
             replica=args.replica,
             test_ratio=args.test_ratio,
         )
-
         result = run_preprocessing(config)
-
         if result.success:
             print("\n✓ Preprocessing complete!")
             print(f"  Entities:    {result.num_entities}")
@@ -729,7 +624,6 @@ def main():
             print(f"  Train:       {result.train_samples} samples")
             print(f"  Valid:       {result.valid_samples} samples")
             print(f"  Test:        {result.test_samples} samples")
-            print(f"  Output:      {result.output_directory}")
         else:
             print(f"\n✗ Preprocessing failed: {result.error_message}")
             sys.exit(1)
@@ -745,7 +639,7 @@ def main():
                 data_directory=Path(args.data_dir),
                 output_directory=DATA_DIR / args.dataset,
                 replica=args.replica,
-                test_ratio=args.test_ratio if hasattr(args, "test_ratio") else 0.2,
+                test_ratio=args.test_ratio,
             )
             result = run_preprocessing(preprocess_config)
             if not result.success:
@@ -753,12 +647,11 @@ def main():
                 sys.exit(1)
             print("\n✓ Preprocessing complete!")
 
-        # Step 1: Pretrain (if using global model)
-        if args.use_global_model:
-            pretrain_path = run_pretrain(args)
-            args.global_model_path = str(pretrain_path)
+        # Step 1: Pretrain encoder
+        encoder_path = run_pretrain(args)
+        args.encoder_path = str(encoder_path)
 
-        # Step 2: Train
+        # Step 2: Train decoder
         best_model_path = run_train(args)
 
         # Step 3: Evaluate

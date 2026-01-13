@@ -162,7 +162,9 @@ class MetricsComputer:
         if self._losses:
             total_samples = sum(self._batch_sizes)
             metrics.loss = (
-                sum(l * n for l, n in zip(self._losses, self._batch_sizes))
+                sum(
+                    loss_val * n for loss_val, n in zip(self._losses, self._batch_sizes)
+                )
                 / total_samples
             )
 
@@ -347,3 +349,115 @@ def find_optimal_threshold(
     # Find best threshold
     best_idx = np.argmax(f1_scores[:-1])  # Last element is placeholder
     return float(thresholds[best_idx])
+
+
+@dataclass
+class TransitionMetrics:
+    """
+    Metrics focused on state transitions (ON→OFF and OFF→ON).
+
+    Measures how well the model captures dynamics beyond persistence.
+    """
+
+    # Counts
+    n_transitions: int = 0  # Total transitions in ground truth
+    n_on_to_off: int = 0  # ON→OFF transitions
+    n_off_to_on: int = 0  # OFF→ON transitions
+    n_persistent: int = 0  # Edges that stayed same state
+
+    # Transition-specific metrics
+    on_to_off_recall: float = 0.0  # Correctly predicted ON→OFF / total ON→OFF
+    on_to_off_precision: float = 0.0
+    off_to_on_recall: float = 0.0  # Correctly predicted OFF→ON / total OFF→ON
+    off_to_on_precision: float = 0.0
+
+    # Overall accuracy breakdown
+    transition_accuracy: float = 0.0  # Accuracy on edges that transitioned
+    persistence_accuracy: float = 0.0  # Accuracy on edges that stayed same
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "n_transitions": self.n_transitions,
+            "n_on_to_off": self.n_on_to_off,
+            "n_off_to_on": self.n_off_to_on,
+            "n_persistent": self.n_persistent,
+            "on_to_off_recall": self.on_to_off_recall,
+            "on_to_off_precision": self.on_to_off_precision,
+            "off_to_on_recall": self.off_to_on_recall,
+            "off_to_on_precision": self.off_to_on_precision,
+            "transition_accuracy": self.transition_accuracy,
+            "persistence_accuracy": self.persistence_accuracy,
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"Transitions: {self.n_transitions} "
+            f"(ON→OFF: {self.n_on_to_off}, OFF→ON: {self.n_off_to_on}) | "
+            f"Trans Acc: {self.transition_accuracy:.3f} | "
+            f"Pers Acc: {self.persistence_accuracy:.3f}"
+        )
+
+
+def compute_transition_metrics(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    prev_states: torch.Tensor,
+) -> TransitionMetrics:
+    """
+    Compute metrics focused on state transitions.
+
+    Args:
+        predictions: Binary predictions (num_pairs, num_timesteps)
+        targets: Ground truth (num_pairs, num_timesteps)
+        prev_states: State at timestep before first prediction (num_pairs,)
+
+    Returns:
+        TransitionMetrics with transition-focused analysis
+    """
+    predictions = predictions.detach().cpu()
+    targets = targets.detach().cpu()
+    prev_states = prev_states.detach().cpu()
+
+    metrics = TransitionMetrics()
+
+    # Extend prev_states to all timesteps
+    # prev_state for timestep t is target at t-1
+    all_prev = torch.cat([prev_states.unsqueeze(1), targets[:, :-1]], dim=1)
+
+    # Identify transitions
+    on_to_off_mask = (all_prev == 1) & (targets == 0)
+    off_to_on_mask = (all_prev == 0) & (targets == 1)
+    persistent_mask = all_prev == targets
+
+    metrics.n_on_to_off = int(on_to_off_mask.sum().item())
+    metrics.n_off_to_on = int(off_to_on_mask.sum().item())
+    metrics.n_transitions = metrics.n_on_to_off + metrics.n_off_to_on
+    metrics.n_persistent = int(persistent_mask.sum().item())
+
+    # ON→OFF metrics (model should predict 0 when transition happens)
+    if metrics.n_on_to_off > 0:
+        tp = ((predictions == 0) & on_to_off_mask).sum().item()
+        metrics.on_to_off_recall = tp / metrics.n_on_to_off
+        pred_off_from_on = ((predictions == 0) & (all_prev == 1)).sum().item()
+        metrics.on_to_off_precision = tp / max(pred_off_from_on, 1)
+
+    # OFF→ON metrics (model should predict 1 when transition happens)
+    if metrics.n_off_to_on > 0:
+        tp = ((predictions == 1) & off_to_on_mask).sum().item()
+        metrics.off_to_on_recall = tp / metrics.n_off_to_on
+        pred_on_from_off = ((predictions == 1) & (all_prev == 0)).sum().item()
+        metrics.off_to_on_precision = tp / max(pred_on_from_off, 1)
+
+    # Overall accuracies
+    transition_mask = on_to_off_mask | off_to_on_mask
+    if transition_mask.sum() > 0:
+        metrics.transition_accuracy = float(
+            (predictions == targets)[transition_mask].float().mean().item()
+        )
+
+    if persistent_mask.sum() > 0:
+        metrics.persistence_accuracy = float(
+            (predictions == targets)[persistent_mask].float().mean().item()
+        )
+
+    return metrics

@@ -302,6 +302,60 @@ class RAPIDModel(nn.Module):
         temporal_embed = self.temporal_encoder(packed)
         return temporal_embed.squeeze(0)
 
+    def encode_context(
+        self,
+        graph_dict: Dict[int, dgl.DGLGraph],
+        entity_history: List[List[Dict]],
+        entity_history_t: List[List[int]],
+        global_emb: Optional[Dict[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Encode all entities using full history context.
+
+        Used by decoder to get static entity representations for cross-attention.
+
+        Args:
+            graph_dict: Graphs per timestep
+            entity_history: History per entity
+            entity_history_t: Timestamps for history
+            global_emb: Optional global embeddings
+
+        Returns:
+            Entity context matrix: (num_entities, hidden_dim)
+        """
+        self._rgcn_cache = {}
+        device = self.entity_embeds.device
+
+        # Pre-compute RGCN for all timesteps
+        all_timesteps = set(graph_dict.keys())
+        self._precompute_rgcn(all_timesteps, graph_dict)
+
+        # Encode each entity
+        entity_context = torch.zeros(self.num_entities, self.hidden_dim, device=device)
+
+        for entity_id in range(self.num_entities):
+            hist = entity_history[entity_id]
+            hist_t = entity_history_t[entity_id]
+
+            if len(hist) == 0:
+                # No history: use base embedding only
+                entity_context[entity_id] = self.get_entity_embed(
+                    torch.tensor([entity_id], device=device)
+                ).squeeze(0)
+            else:
+                # Encode temporal context
+                temporal_emb = self._encode_history(
+                    entity_id, hist, hist_t, graph_dict, global_emb
+                )
+                base_emb = self.get_entity_embed(
+                    torch.tensor([entity_id], device=device)
+                ).squeeze(0)
+
+                # Combine base + temporal
+                entity_context[entity_id] = base_emb + temporal_emb
+
+        return entity_context
+
     def forward(
         self,
         entity1_ids: torch.Tensor,
