@@ -18,6 +18,7 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,43 @@ def compute_statistics(dataset: pd.DataFrame, metadata: dict) -> Tuple[int, int,
     return num_entities, num_relations, num_timesteps
 
 
+def save_full_graphs(df: pd.DataFrame, metadata: dict, output_dir: Path) -> None:
+    """Save full graphs (inter + intra) per timestep for subgraph encoder.
+
+    Creates a file with per-timestep edge data that can be used for
+    N-hop neighborhood extraction in the subgraph encoder.
+
+    Args:
+        df: Full DataFrame with all interactions (must have entity_a, entity_b columns)
+        metadata: Entity metadata with entity_to_id mapping
+        output_dir: Directory to save full_graphs.pt
+    """
+    entity_to_id = metadata["entity_to_id"]
+
+    # Ensure entity columns exist
+    if "entity_a" not in df.columns:
+        df = df.copy()
+        df["entity_a"] = df["chain_a"] + df["resid_a"].astype(str)
+        df["entity_b"] = df["chain_b"] + df["resid_b"].astype(str)
+
+    graphs = {}
+    all_timesteps = sorted(df["timestep"].unique())
+
+    for t in all_timesteps:
+        grp = df[df["timestep"] == t]
+        src = grp["entity_a"].map(entity_to_id).values.astype(int)
+        dst = grp["entity_b"].map(entity_to_id).values.astype(int)
+        is_inter = (grp["chain_a"] != grp["chain_b"]).values
+
+        graphs[int(t)] = {
+            "src": torch.tensor(src, dtype=torch.long),
+            "dst": torch.tensor(dst, dtype=torch.long),
+            "is_inter": torch.tensor(is_inter, dtype=torch.bool),
+        }
+
+    torch.save(graphs, output_dir / "full_graphs.pt")
+
+
 def run_preprocessing(config: PreprocessingConfig) -> PreprocessingResult:
     """Execute the full preprocessing pipeline.
 
@@ -344,6 +382,9 @@ def run_preprocessing(config: PreprocessingConfig) -> PreprocessingResult:
         metadata_path = config.output_directory / "metadata.json"
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
+
+        # Save full graphs for subgraph encoder (includes inter + intra)
+        save_full_graphs(df, metadata, config.output_directory)
 
         logger.info("Preprocessing complete")
 

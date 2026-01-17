@@ -91,3 +91,14 @@ class DecoderConfig:
     num_heads: int = 8
     max_timesteps: int = 200
     dropout: float = 0.1
+
+
+@dataclass
+class SubgraphConfig:
+    """Configuration for edge-centric subgraph encoder."""
+
+    enabled: bool = True
+    n_hops: int = 2  # Neighborhood radius
+    max_subgraph_edges: int = 50  # Max neighbor edges to consider
+    num_heads: int = 4
+    num_layers: int = 2

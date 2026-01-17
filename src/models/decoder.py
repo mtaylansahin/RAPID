@@ -1,10 +1,12 @@
 """Transformer decoder for seq2seq edge prediction."""
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+from src.models.subgraph_encoder import EdgeCentricSubgraphEncoder
 
 
 class PositionalEncoding(nn.Module):
@@ -129,6 +131,7 @@ class TemporalEdgeDecoder(nn.Module):
         num_heads: Number of attention heads
         max_timesteps: Maximum number of timesteps to predict
         dropout: Dropout rate
+        use_edge_history: Enable edge-centric subgraph encoder for temporal context
     """
 
     def __init__(
@@ -155,15 +158,15 @@ class TemporalEdgeDecoder(nn.Module):
         # Positional encoding for temporal ordering
         self.pos_encoding = PositionalEncoding(hidden_dim, max_timesteps, dropout)
 
-        # Edge history encoder (optional) - uses Transformer over full history
+        # Edge history encoder: uses EdgeCentricSubgraphEncoder for N-hop context
         self.edge_history_encoder = None
         if use_edge_history:
-            self.edge_history_encoder = EdgeHistoryEncoder(
+            self.edge_history_encoder = EdgeCentricSubgraphEncoder(
                 hidden_dim=hidden_dim,
                 num_heads=4,
                 num_layers=2,
+                max_neighbors=50,
                 dropout=dropout,
-                max_history_len=500,
             )
 
         # Transformer decoder layers
@@ -192,6 +195,7 @@ class TemporalEdgeDecoder(nn.Module):
         pair_indices: torch.Tensor,
         relative_timesteps: torch.Tensor,
         edge_history: torch.Tensor = None,
+        subgraph_context: Optional[dict] = None,
         causal: bool = True,
     ) -> torch.Tensor:
         """
@@ -202,6 +206,11 @@ class TemporalEdgeDecoder(nn.Module):
             pair_indices: Entity pair indices (num_pairs, 2)
             relative_timesteps: Timesteps relative to train boundary (num_timesteps,)
             edge_history: Optional edge state history (num_pairs, history_len)
+            subgraph_context: Optional dict with subgraph tensors for EdgeCentricSubgraphEncoder:
+                - target_histories: (num_pairs, num_timesteps) target edge histories
+                - neighbor_histories: (num_pairs, max_neighbors, num_timesteps)
+                - hop_distances: (num_pairs, max_neighbors)
+                - neighbor_mask: (num_pairs, max_neighbors) True for padding
             causal: Whether to use causal masking for temporal autoregression
 
         Returns:
@@ -216,9 +225,14 @@ class TemporalEdgeDecoder(nn.Module):
         e2_ctx = entity_context[pair_indices[:, 1]]  # (num_pairs, hidden)
         pair_emb = self.pair_proj(torch.cat([e1_ctx, e2_ctx], dim=-1))
 
-        # Add edge history embedding if available
-        if self.edge_history_encoder is not None and edge_history is not None:
-            edge_hist_emb = self.edge_history_encoder(edge_history)
+        # Add context from edge history encoder (uses subgraph context)
+        if self.edge_history_encoder is not None and subgraph_context is not None:
+            edge_hist_emb = self.edge_history_encoder(
+                target_histories=subgraph_context["target_histories"],
+                neighbor_histories=subgraph_context["neighbor_histories"],
+                hop_distances=subgraph_context["hop_distances"],
+                neighbor_mask=subgraph_context.get("neighbor_mask"),
+            )
             pair_emb = pair_emb + edge_hist_emb
 
         pair_emb = self.dropout(pair_emb)
@@ -260,6 +274,7 @@ class TemporalEdgeDecoder(nn.Module):
         pair_indices: torch.Tensor,
         relative_timesteps: torch.Tensor,
         edge_history: torch.Tensor = None,
+        subgraph_context: Optional[dict] = None,
         threshold: float = 0.5,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -270,6 +285,7 @@ class TemporalEdgeDecoder(nn.Module):
             pair_indices: Entity pair indices
             relative_timesteps: Timesteps relative to train boundary
             edge_history: Optional edge state history (num_pairs, history_len)
+            subgraph_context: Optional subgraph context for EdgeCentricSubgraphEncoder
             threshold: Classification threshold
 
         Returns:
@@ -281,6 +297,7 @@ class TemporalEdgeDecoder(nn.Module):
                 pair_indices,
                 relative_timesteps,
                 edge_history=edge_history,
+                subgraph_context=subgraph_context,
                 causal=False,
             )
             probs = torch.sigmoid(logits)

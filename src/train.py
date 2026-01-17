@@ -248,9 +248,27 @@ class Trainer:
             if edge_history is not None:
                 batch_edge_history = edge_history[start_idx:end_idx]
 
+            # Get subgraph context batch if decoder uses edge history encoder
+            batch_subgraph_context = None
+            if self.decoder.use_edge_history and hasattr(
+                self.data_module, "get_subgraph_context"
+            ):
+                batch_subgraph_context = self.data_module.get_subgraph_context(
+                    batch_pairs.tolist()
+                )
+                if batch_subgraph_context is not None:
+                    # Move tensors to device
+                    batch_subgraph_context = {
+                        k: v.to(self.device) for k, v in batch_subgraph_context.items()
+                    }
+
             # Decode
             logits = self.decoder(
-                entity_context, batch_pairs, relative_t, edge_history=batch_edge_history
+                entity_context,
+                batch_pairs,
+                relative_t,
+                edge_history=batch_edge_history,
+                subgraph_context=batch_subgraph_context,
             )
 
             # Compute transition weights
@@ -335,8 +353,26 @@ class Trainer:
             batch_edge_history = None
             if val_edge_history is not None:
                 batch_edge_history = val_edge_history[start_idx:end_idx]
+
+            # Get subgraph context batch if decoder uses edge history encoder
+            batch_subgraph_context = None
+            if self.decoder.use_edge_history and hasattr(
+                self.data_module, "get_subgraph_context"
+            ):
+                batch_subgraph_context = self.data_module.get_subgraph_context(
+                    batch_pairs.tolist()
+                )
+                if batch_subgraph_context is not None:
+                    batch_subgraph_context = {
+                        k: v.to(self.device) for k, v in batch_subgraph_context.items()
+                    }
+
             logits = self.decoder(
-                entity_context, batch_pairs, relative_t, edge_history=batch_edge_history
+                entity_context,
+                batch_pairs,
+                relative_t,
+                edge_history=batch_edge_history,
+                subgraph_context=batch_subgraph_context,
             )
             all_logits.append(logits.cpu())
 

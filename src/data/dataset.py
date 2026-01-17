@@ -212,6 +212,46 @@ class PPIDataModule:
         self.graph_dict = self._build_graph_dict()
         self.entity_history, self.entity_history_t = self._build_histories()
 
+        # Lazy-loaded for subgraph encoder
+        self._full_graphs = None
+        self._subgraph_extractor = None
+
+    @property
+    def full_graphs(self) -> Optional[Dict]:
+        """Lazy-load full graphs (inter + intra) per timestep."""
+        if self._full_graphs is None:
+            path = self.data_path / "full_graphs.pt"
+            if path.exists():
+                self._full_graphs = torch.load(path)
+        return self._full_graphs
+
+    @property
+    def subgraph_extractor(self):
+        """Lazy-load subgraph extractor for N-hop neighborhood context."""
+        if self._subgraph_extractor is None and self.full_graphs is not None:
+            from src.data.subgraph_extractor import SubgraphExtractor
+
+            train_times = sorted(set(self.train_dataset.timesteps))
+            self._subgraph_extractor = SubgraphExtractor(
+                full_graphs=self.full_graphs,
+                train_timesteps=train_times,
+                n_hops=2,
+            )
+        return self._subgraph_extractor
+
+    def get_subgraph_context(
+        self,
+        entity_pairs: List[Tuple[int, int]],
+        max_neighbors: int = 50,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Get subgraph context for a batch of entity pairs.
+
+        Returns None if subgraph extractor is not available.
+        """
+        if self.subgraph_extractor is None:
+            return None
+        return self.subgraph_extractor.extract_batch(entity_pairs, max_neighbors)
+
     def _build_graph_dict(self) -> Dict[int, dgl.DGLGraph]:
         """Build DGL graphs for each timestep from training data."""
         graph_dict = {}

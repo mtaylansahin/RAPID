@@ -205,7 +205,7 @@ def run_train(args) -> Path:
 
     device = setup_env(args)
 
-    # Load data
+    # Load data (PPIDataModule now has integrated subgraph support)
     print(f"\nLoading dataset: {args.dataset}")
     data_module = PPIDataModule(
         data_path=DATA_DIR / args.dataset,
@@ -214,6 +214,10 @@ def run_train(args) -> Path:
         hard_ratio=args.hard_ratio,
         seed=args.seed,
     )
+
+    # Check if subgraph data is available
+    if getattr(args, "use_edge_history", False) and data_module.full_graphs is not None:
+        print("  Full graph data available for edge-centric encoding")
 
     # Compute node features if needed
     node_features = None
@@ -250,13 +254,17 @@ def run_train(args) -> Path:
 
     # Create decoder
     print("\nCreating decoder...")
+    use_edge_history = getattr(args, "use_edge_history", False)
+    if use_edge_history:
+        print("  Using EdgeCentricSubgraphEncoder")
+
     decoder = create_decoder(
         hidden_dim=args.hidden_dim,
         num_layers=args.decoder_layers,
         num_heads=args.decoder_heads,
         max_timesteps=200,
         dropout=args.dropout,
-        use_edge_history=getattr(args, "use_edge_history", False),
+        use_edge_history=use_edge_history,
     )
     print(f"Decoder parameters: {sum(p.numel() for p in decoder.parameters()):,}")
 
@@ -506,7 +514,7 @@ def main():
     train_parser.add_argument(
         "--use_edge_history",
         action="store_true",
-        help="Enable Transformer-based edge history encoder (uses full history)",
+        help="Enable edge-centric subgraph encoder for N-hop temporal context",
     )
 
     # === Evaluate command ===
@@ -565,10 +573,21 @@ def main():
     all_parser.add_argument("--predictions_dir", type=str, default=str(PREDICTIONS_DIR))
     all_parser.add_argument("--checkpoint", type=str, default=None)
     all_parser.add_argument("--no_node_features", action="store_true")
+    all_parser.add_argument(
+        "--use_edge_history",
+        action="store_true",
+        help="Enable edge-centric subgraph encoder",
+    )
     # Preprocess args
     all_parser.add_argument("--data_dir", type=str, default=None)
     all_parser.add_argument("--replica", type=str, default=None)
     all_parser.add_argument("--test_ratio", type=float, default=0.2)
+    all_parser.add_argument(
+        "--transition_weight",
+        type=float,
+        default=1.0,
+        help="Weight multiplier for transition samples",
+    )
 
     # === Preprocess command ===
     preprocess_parser = subparsers.add_parser(
