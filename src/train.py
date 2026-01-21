@@ -90,21 +90,11 @@ class Trainer:
     def _get_known_pairs(self) -> torch.Tensor:
         """Get all known pairs as tensor."""
         if not hasattr(self.data_module, "known_pairs_list"):
-            # Trigger lazy computation
             self.data_module.get_history_pairs_for_timestep(0, split="test")
         return torch.tensor(self.data_module.known_pairs_list, dtype=torch.long)
 
     def _get_target_matrix(self, timesteps: List[int], split: str) -> torch.Tensor:
-        """
-        Build target matrix for all pairs × timesteps.
-
-        Args:
-            timesteps: List of timesteps
-            split: 'valid' or 'test'
-
-        Returns:
-            targets: (num_pairs, num_timesteps) binary tensor
-        """
+        """Build target matrix for all pairs × timesteps."""
         dataset = (
             self.data_module.val_dataset
             if split == "valid"
@@ -124,13 +114,7 @@ class Trainer:
         return targets
 
     def _get_previous_states(self, timesteps: List[int], split: str) -> torch.Tensor:
-        """
-        Get edge states at timestep before each target timestep.
-
-        Returns:
-            prev_states: (num_pairs, num_timesteps) with state at t-1 for each t
-        """
-        # Build list of all timesteps we have data for
+        """Get edge states at timestep before each target timestep."""
         all_times = sorted(
             set(self.data_module.train_dataset.timesteps)
             | set(self.data_module.val_dataset.timesteps)
@@ -141,7 +125,6 @@ class Trainer:
         prev_states = torch.zeros(num_pairs, num_timesteps)
 
         for t_idx, t in enumerate(timesteps):
-            # Find previous timestep
             prev_t = None
             for candidate in reversed(all_times):
                 if candidate < t:
@@ -151,7 +134,6 @@ class Trainer:
             if prev_t is None:
                 continue
 
-            # Get edges at prev_t
             prev_edges = set()
             for ds in [self.data_module.train_dataset, self.data_module.val_dataset]:
                 prev_edges.update(ds.positives_by_timestep.get(prev_t, set()))
@@ -162,31 +144,17 @@ class Trainer:
 
         return prev_states
 
-    def _get_edge_history(self) -> torch.Tensor:
-        """
-        Get FULL edge state history for each pair from training data.
-
-        Returns:
-            edge_history: (num_pairs, num_train_timesteps) binary tensor
-                          ordered chronologically (oldest first, newest last)
-        """
-        # Get all train timesteps sorted chronologically
-        train_times = sorted(set(self.data_module.train_dataset.timesteps))
-
-        num_pairs = len(self.known_pairs)
-        num_timesteps = len(train_times)
-        edge_history = torch.zeros(num_pairs, num_timesteps)
-
-        # Fill history chronologically
-        for t_idx, t in enumerate(train_times):
-            pos_edges = self.data_module.train_dataset.positives_by_timestep.get(
-                t, set()
+    def _get_subgraph_context(self, batch_pairs: torch.Tensor) -> dict:
+        """Get subgraph context for a batch of pairs (required for edge-centric encoder)."""
+        batch_subgraph_context = self.data_module.get_subgraph_context(
+            batch_pairs.tolist()
+        )
+        if batch_subgraph_context is None:
+            raise RuntimeError(
+                "Subgraph context is required but data_module.get_subgraph_context() "
+                "returned None. Ensure SubgraphExtractor is properly initialized."
             )
-            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
-                if (e1, e2) in pos_edges or (e2, e1) in pos_edges:
-                    edge_history[p_idx, t_idx] = 1.0
-
-        return edge_history
+        return {k: v.to(self.device) for k, v in batch_subgraph_context.items()}
 
     def train_epoch(self, epoch: int) -> float:
         """Train for one epoch on validation timesteps."""
@@ -196,13 +164,9 @@ class Trainer:
             self.encoder.train()
         self.decoder.train()
 
-        # Encode context from training data
+        # Encode context - simplified: only needs graph_dict
         with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
-            entity_context = self.encoder(
-                self.data_module.graph_dict,
-                self.data_module.entity_history,
-                self.data_module.entity_history_t,
-            )
+            entity_context = self.encoder(self.data_module.graph_dict)
 
         # Prepare targets
         target_matrix = self._get_target_matrix(self.val_timesteps, "valid").to(
@@ -223,11 +187,6 @@ class Trainer:
                 self.device
             )
 
-        # Get edge history if decoder uses it
-        edge_history = None
-        if self.decoder.use_edge_history:
-            edge_history = self._get_edge_history().to(self.device)
-
         # Forward pass (process pairs in batches for memory)
         pair_batch_size = 256
         total_loss = 0.0
@@ -243,49 +202,28 @@ class Trainer:
             batch_pairs = self.known_pairs[start_idx:end_idx].to(self.device)
             batch_targets = target_matrix[start_idx:end_idx]
 
-            # Get edge history batch
-            batch_edge_history = None
-            if edge_history is not None:
-                batch_edge_history = edge_history[start_idx:end_idx]
-
-            # Get subgraph context batch if decoder uses edge history encoder
-            batch_subgraph_context = None
-            if self.decoder.use_edge_history and hasattr(
-                self.data_module, "get_subgraph_context"
-            ):
-                batch_subgraph_context = self.data_module.get_subgraph_context(
-                    batch_pairs.tolist()
-                )
-                if batch_subgraph_context is not None:
-                    # Move tensors to device
-                    batch_subgraph_context = {
-                        k: v.to(self.device) for k, v in batch_subgraph_context.items()
-                    }
+            # Get subgraph context (required for edge-centric encoder)
+            batch_subgraph_context = self._get_subgraph_context(batch_pairs)
 
             # Decode
             logits = self.decoder(
                 entity_context,
                 batch_pairs,
                 relative_t,
-                edge_history=batch_edge_history,
                 subgraph_context=batch_subgraph_context,
             )
 
             # Compute transition weights
             if self.config.transition_weight > 1.0:
                 batch_prev = prev_states[start_idx:end_idx]
-                # Identify transitions: where prev != target
                 is_transition = (batch_prev != batch_targets).float()
-                # Weight: transition_weight for transitions, 1.0 for persistence
                 weights = 1.0 + (self.config.transition_weight - 1.0) * is_transition
                 weights = weights.view(-1)
 
-                # Compute per-sample loss and apply weights
                 per_sample_loss = self.criterion(
                     logits.view(-1), batch_targets.view(-1)
                 )
                 if per_sample_loss.dim() == 0:
-                    # Criterion returns mean, need to recompute
                     import torch.nn.functional as F
 
                     per_sample_loss = F.binary_cross_entropy_with_logits(
@@ -293,7 +231,6 @@ class Trainer:
                     )
                 loss = (per_sample_loss * weights).mean()
             else:
-                # Standard loss without weighting
                 loss = self.criterion(logits.view(-1), batch_targets.view(-1))
 
             self.optimizer.zero_grad()
@@ -316,14 +253,8 @@ class Trainer:
         self.encoder.eval()
         self.decoder.eval()
 
-        # Use train+val context for test evaluation
-        context_graph_dict, context_history, context_history_t = (
-            self.data_module.get_train_val_context()
-        )
-
-        entity_context = self.encoder(
-            context_graph_dict, context_history, context_history_t
-        )
+        # Use graph_dict for context (simplified)
+        entity_context = self.encoder(self.data_module.graph_dict)
 
         # Get test targets
         target_matrix = self._get_target_matrix(self.test_timesteps, "test").to(
@@ -337,12 +268,6 @@ class Trainer:
             device=self.device,
         )
 
-        # Get edge history for validation if decoder uses it
-        val_edge_history = None
-        if self.decoder.use_edge_history:
-            # For validation on test set, we use history from train data
-            val_edge_history = self._get_edge_history().to(self.device)
-
         # Predict all at once (in batches for memory)
         all_logits = []
         pair_batch_size = 512
@@ -350,33 +275,19 @@ class Trainer:
         for start_idx in range(0, len(self.known_pairs), pair_batch_size):
             end_idx = min(start_idx + pair_batch_size, len(self.known_pairs))
             batch_pairs = self.known_pairs[start_idx:end_idx].to(self.device)
-            batch_edge_history = None
-            if val_edge_history is not None:
-                batch_edge_history = val_edge_history[start_idx:end_idx]
 
-            # Get subgraph context batch if decoder uses edge history encoder
-            batch_subgraph_context = None
-            if self.decoder.use_edge_history and hasattr(
-                self.data_module, "get_subgraph_context"
-            ):
-                batch_subgraph_context = self.data_module.get_subgraph_context(
-                    batch_pairs.tolist()
-                )
-                if batch_subgraph_context is not None:
-                    batch_subgraph_context = {
-                        k: v.to(self.device) for k, v in batch_subgraph_context.items()
-                    }
+            # Get subgraph context (required)
+            batch_subgraph_context = self._get_subgraph_context(batch_pairs)
 
             logits = self.decoder(
                 entity_context,
                 batch_pairs,
                 relative_t,
-                edge_history=batch_edge_history,
                 subgraph_context=batch_subgraph_context,
             )
             all_logits.append(logits.cpu())
 
-        all_logits = torch.cat(all_logits, dim=0)  # (num_pairs, num_timesteps)
+        all_logits = torch.cat(all_logits, dim=0)
 
         # Flatten for metrics
         logits_flat = all_logits.view(-1)
@@ -450,7 +361,6 @@ class Trainer:
                 "decoder": {
                     "num_layers": self.decoder.num_layers,
                     "max_timesteps": self.decoder.max_timesteps,
-                    "use_edge_history": self.decoder.use_edge_history,
                 },
             },
         }

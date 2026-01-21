@@ -83,7 +83,6 @@ class Evaluator:
         """Get edge states at the timestep before the first test timestep."""
         first_test_t = min(timesteps)
 
-        # Find the previous timestep
         all_times = sorted(
             set(self.data_module.train_dataset.timesteps)
             | set(self.data_module.val_dataset.timesteps)
@@ -97,7 +96,6 @@ class Evaluator:
         prev_states = torch.zeros(len(self.known_pairs))
 
         if prev_t is not None:
-            # Get edges at prev_t
             prev_edges = set()
             for ds in [
                 self.data_module.train_dataset,
@@ -111,44 +109,21 @@ class Evaluator:
 
         return prev_states
 
-    def _get_edge_history(self) -> torch.Tensor:
-        """
-        Get FULL edge state history for each pair from train+val data.
-
-        Returns:
-            edge_history: (num_pairs, num_timesteps) binary tensor
-                          ordered chronologically (oldest first, newest last)
-        """
-        # Get all train+val timesteps sorted chronologically
-        all_times = sorted(
-            set(self.data_module.train_dataset.timesteps)
-            | set(self.data_module.val_dataset.timesteps)
+    def _get_subgraph_context(self, batch_pairs: torch.Tensor) -> dict:
+        """Get subgraph context for a batch of pairs (required)."""
+        batch_subgraph_context = self.data_module.get_subgraph_context(
+            batch_pairs.tolist()
         )
-
-        num_pairs = len(self.known_pairs)
-        num_timesteps = len(all_times)
-        edge_history = torch.zeros(num_pairs, num_timesteps)
-
-        # Fill history chronologically
-        for t_idx, t in enumerate(all_times):
-            pos_edges = set()
-            for ds in [self.data_module.train_dataset, self.data_module.val_dataset]:
-                pos_edges.update(ds.positives_by_timestep.get(t, set()))
-
-            for p_idx, (e1, e2) in enumerate(self.known_pairs.tolist()):
-                if (e1, e2) in pos_edges or (e2, e1) in pos_edges:
-                    edge_history[p_idx, t_idx] = 1.0
-
-        return edge_history
+        if batch_subgraph_context is None:
+            raise RuntimeError(
+                "Subgraph context is required but data_module.get_subgraph_context() "
+                "returned None. Ensure SubgraphExtractor is properly initialized."
+            )
+        return {k: v.to(self.device) for k, v in batch_subgraph_context.items()}
 
     @torch.no_grad()
     def run_inference(self, force_rerun: bool = False) -> Dict[str, Any]:
-        """
-        Run seq2seq inference on test set.
-
-        Returns:
-            Dictionary with logits, predictions, and targets
-        """
+        """Run seq2seq inference on test set."""
         if not force_rerun and self._cached_results is not None:
             return self._cached_results
 
@@ -157,15 +132,8 @@ class Evaluator:
 
         print("\nRunning seq2seq inference...")
 
-        # Use train+val context
-        context_graph_dict, context_history, context_history_t = (
-            self.data_module.get_train_val_context()
-        )
-
-        # Encode all entities
-        entity_context = self.encoder(
-            context_graph_dict, context_history, context_history_t
-        )
+        # Encode entities - simplified: only needs graph_dict
+        entity_context = self.encoder(self.data_module.graph_dict)
 
         # Get targets
         target_matrix = self._get_target_matrix(self.test_timesteps)
@@ -177,12 +145,6 @@ class Evaluator:
             dtype=torch.long,
             device=self.device,
         )
-
-        # Get edge history if decoder uses it
-        # Get edge history if decoder uses it
-        edge_history = None
-        if self.decoder.use_edge_history:
-            edge_history = self._get_edge_history().to(self.device)
 
         # Predict in batches
         all_logits = []
@@ -196,22 +158,20 @@ class Evaluator:
             end_idx = min(start_idx + pair_batch_size, len(self.known_pairs))
             batch_pairs = self.known_pairs[start_idx:end_idx].to(self.device)
 
-            # Get edge history batch
-            batch_edge_history = None
-            if edge_history is not None:
-                batch_edge_history = edge_history[start_idx:end_idx]
+            # Get subgraph context (required)
+            batch_subgraph_context = self._get_subgraph_context(batch_pairs)
 
             probs, preds, logits = self.decoder.predict(
                 entity_context,
                 batch_pairs,
                 relative_t,
-                edge_history=batch_edge_history,
+                subgraph_context=batch_subgraph_context,
                 threshold=self.threshold,
             )
             all_logits.append(logits.cpu())
             all_probs.append(probs.cpu())
 
-        all_logits = torch.cat(all_logits, dim=0)  # (num_pairs, num_timesteps)
+        all_logits = torch.cat(all_logits, dim=0)
         all_probs = torch.cat(all_probs, dim=0)
         all_preds = (all_probs >= self.threshold).long()
 
@@ -260,7 +220,6 @@ class Evaluator:
         logits_flat = results["logits"].view(-1)
         targets_flat = results["targets"].view(-1)
 
-        # Report class balance
         n_pos = targets_flat.sum().item()
         n_neg = len(targets_flat) - n_pos
         print(
@@ -280,14 +239,7 @@ class Evaluator:
         logits_flat = results["logits"].view(-1)
         targets_flat = results["targets"].view(-1)
 
-        # Build timestep tensor
         num_pairs = len(self.known_pairs)
-        timesteps_tensor = torch.tensor(
-            [t for t in self.test_timesteps for _ in range(num_pairs)]
-        )
-
-        # Reshape correctly: (pairs, timesteps) -> (pairs * timesteps,)
-        # Each pair has all timesteps, so we need to expand differently
         timesteps_per_sample = (
             torch.tensor(self.test_timesteps)
             .unsqueeze(0)
@@ -313,20 +265,11 @@ class Evaluator:
         )
 
     def full_evaluation(self) -> Dict[str, Any]:
-        """
-        Run full evaluation with all analyses.
-
-        Returns comprehensive metrics including:
-        - Overall classification metrics
-        - Per-timestep breakdown
-        - Transition-focused metrics
-        """
-        # Force fresh run
+        """Run full evaluation with all analyses."""
         self.run_inference(force_rerun=True)
 
         output = {}
 
-        # Main metrics
         print("\n" + "=" * 50)
         print("Test Results")
         print("=" * 50)
@@ -335,14 +278,12 @@ class Evaluator:
         output["metrics"] = metrics.to_dict()
         print(f"\n{metrics}")
 
-        # Per-timestep analysis
         per_ts_metrics = self.evaluate_per_timestep()
         output["per_timestep"] = per_ts_metrics.to_dict()
         print(f"\nPer-Timestep Analysis:")
         print(f"  Mean AUPRC: {per_ts_metrics.mean_auprc:.4f}")
         print(f"  Mean F1: {per_ts_metrics.mean_f1:.4f}")
 
-        # Transition metrics
         trans_metrics = self.evaluate_transitions()
         output["transitions"] = trans_metrics.to_dict()
         print(f"\nTransition Analysis:")
@@ -350,7 +291,6 @@ class Evaluator:
         print(f"  ON→OFF Recall: {trans_metrics.on_to_off_recall:.3f}")
         print(f"  OFF→ON Recall: {trans_metrics.off_to_on_recall:.3f}")
 
-        # Check for temporal degradation
         if len(per_ts_metrics.auprcs) > 5:
             early = np.mean(per_ts_metrics.auprcs[:5])
             late = np.mean(per_ts_metrics.auprcs[-5:])

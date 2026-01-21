@@ -6,25 +6,96 @@ import torch
 import torch.nn as nn
 
 
+class SymmetricPairProjection(nn.Module):
+    """
+    Create symmetric pair embedding from two entity embeddings.
+
+    Uses symmetric operations (sum, product, abs diff) to ensure
+    score(e1, e2) = score(e2, e1) by construction.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        # Output: sum + product + abs_diff = 3 * hidden_dim
+        self.output_dim = 3 * hidden_dim
+
+    def forward(
+        self,
+        entity1_embed: torch.Tensor,
+        entity2_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Create symmetric pair embedding.
+
+        Args:
+            entity1_embed: First entity embedding (batch, hidden_dim)
+            entity2_embed: Second entity embedding (batch, hidden_dim)
+
+        Returns:
+            Symmetric pair embedding (batch, 3 * hidden_dim)
+        """
+        pair_sum = entity1_embed + entity2_embed
+        pair_prod = entity1_embed * entity2_embed
+        pair_diff = torch.abs(entity1_embed - entity2_embed)
+        return torch.cat([pair_sum, pair_prod, pair_diff], dim=-1)
+
+
 class EdgeClassifier(nn.Module):
     """
-    Binary classifier for predicting edge existence.
+    Binary classifier for edge prediction.
 
-    Takes embeddings of two entities and optional relation/temporal context,
-    and outputs a logit for binary classification.
+    Takes a fused pair embedding and outputs a logit for binary classification.
 
-    Supports multiple scoring functions:
-    - 'concat': Concatenate embeddings and pass through MLP
-    - 'bilinear': Bilinear scoring function
-    - 'dot': Simple dot product (no learnable parameters)
+    Args:
+        input_dim: Input dimension (from pair projection + temporal fusion)
+        hidden_dim: Hidden dimension in classifier MLP
+        dropout: Dropout rate
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, pair_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Compute edge existence logits.
+
+        Args:
+            pair_embedding: Fused pair embedding (batch, input_dim)
+
+        Returns:
+            Logits of shape (batch,)
+        """
+        return self.classifier(pair_embedding).squeeze(-1)
+
+
+class SymmetricEdgeClassifier(nn.Module):
+    """
+    Symmetric edge classifier combining pair projection and classification.
+
+    For an undirected edge (i, j), the score is the same as (j, i)
+    by construction through symmetric operations.
 
     Args:
         hidden_dim: Entity embedding dimension
         classifier_hidden_dim: Hidden dimension in classifier MLP
         dropout: Dropout rate
-        scoring_fn: Scoring function type ('concat', 'bilinear', 'dot')
-        use_relation: Whether to include relation embedding
-        use_temporal: Whether to include temporal embedding
+        use_temporal: Whether temporal embedding is included in input
     """
 
     def __init__(
@@ -32,141 +103,60 @@ class EdgeClassifier(nn.Module):
         hidden_dim: int,
         classifier_hidden_dim: int = 128,
         dropout: float = 0.2,
-        scoring_fn: str = "concat",
-        use_relation: bool = True,
         use_temporal: bool = True,
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
-        self.scoring_fn = scoring_fn
-        self.use_relation = use_relation
         self.use_temporal = use_temporal
 
-        # Compute input dimension based on what's included
-        # Base: entity1_embed + entity2_embed
-        input_dim = 2 * hidden_dim
+        # Symmetric pair projection
+        self.pair_proj = SymmetricPairProjection(hidden_dim)
 
-        # Add temporal embeddings (from GRU)
+        # Calculate input dimension
+        # From pair projection: 3 * hidden_dim
+        # If use_temporal, we expect temporal embedding to be added externally
+        input_dim = self.pair_proj.output_dim
         if use_temporal:
-            input_dim += 2 * hidden_dim  # temporal for each entity
+            # Temporal embedding (from edge history encoder) is same dim as hidden
+            input_dim += hidden_dim
 
-        # Note: We don't add relation dim here since we're predicting
-        # edge existence regardless of type. Relation info is used as
-        # edge features in RGCN, not in the classifier.
-
-        if scoring_fn == "concat":
-            self.classifier = nn.Sequential(
-                nn.Linear(input_dim, classifier_hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(classifier_hidden_dim, classifier_hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(classifier_hidden_dim // 2, 1),
-            )
-        elif scoring_fn == "bilinear":
-            # W matrix for bilinear: h1^T W h2
-            self.bilinear = nn.Bilinear(hidden_dim, hidden_dim, 1)
-            if use_temporal:
-                self.temporal_linear = nn.Linear(2 * hidden_dim, 1)
-        elif scoring_fn == "dot":
-            # Project to same space then dot
-            self.proj = nn.Linear(hidden_dim, hidden_dim)
-            if use_temporal:
-                self.temporal_linear = nn.Linear(2 * hidden_dim, 1)
-        else:
-            raise ValueError(f"Unknown scoring function: {scoring_fn}")
+        self.classifier = EdgeClassifier(
+            input_dim=input_dim,
+            hidden_dim=classifier_hidden_dim,
+            dropout=dropout,
+        )
 
     def forward(
         self,
         entity1_embed: torch.Tensor,
         entity2_embed: torch.Tensor,
-        entity1_temporal: Optional[torch.Tensor] = None,
-        entity2_temporal: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute edge existence logits.
-
-        Args:
-            entity1_embed: Embedding of first entity, shape (batch_size, hidden_dim)
-            entity2_embed: Embedding of second entity, shape (batch_size, hidden_dim)
-            entity1_temporal: Temporal embedding for entity1, shape (batch_size, hidden_dim)
-            entity2_temporal: Temporal embedding for entity2, shape (batch_size, hidden_dim)
-
-        Returns:
-            Logits of shape (batch_size,) or (batch_size, 1)
-        """
-        if self.scoring_fn == "concat":
-            # Concatenate all embeddings
-            inputs = [entity1_embed, entity2_embed]
-
-            if self.use_temporal:
-                if entity1_temporal is not None:
-                    inputs.append(entity1_temporal)
-                else:
-                    inputs.append(torch.zeros_like(entity1_embed))
-
-                if entity2_temporal is not None:
-                    inputs.append(entity2_temporal)
-                else:
-                    inputs.append(torch.zeros_like(entity2_embed))
-
-            x = torch.cat(inputs, dim=-1)
-            logits = self.classifier(x).squeeze(-1)
-
-        elif self.scoring_fn == "bilinear":
-            # Bilinear scoring
-            logits = self.bilinear(entity1_embed, entity2_embed).squeeze(-1)
-
-            if self.use_temporal and entity1_temporal is not None:
-                temporal = torch.cat([entity1_temporal, entity2_temporal], dim=-1)
-                logits = logits + self.temporal_linear(temporal).squeeze(-1)
-
-        elif self.scoring_fn == "dot":
-            # Dot product scoring
-            proj1 = self.proj(entity1_embed)
-            proj2 = self.proj(entity2_embed)
-            logits = (proj1 * proj2).sum(dim=-1)
-
-            if self.use_temporal and entity1_temporal is not None:
-                temporal = torch.cat([entity1_temporal, entity2_temporal], dim=-1)
-                logits = logits + self.temporal_linear(temporal).squeeze(-1)
-
-        return logits
-
-
-class SymmetricEdgeClassifier(EdgeClassifier):
-    """
-    Edge classifier that enforces symmetry for undirected graphs.
-
-    For an undirected edge (i, j), the score should be the same as (j, i).
-    This is achieved by processing both orderings and averaging.
-
-    Args:
-        Same as EdgeClassifier
-    """
-
-    def forward(
-        self,
-        entity1_embed: torch.Tensor,
-        entity2_embed: torch.Tensor,
-        entity1_temporal: Optional[torch.Tensor] = None,
-        entity2_temporal: Optional[torch.Tensor] = None,
+        temporal_embed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute symmetric edge existence logits.
 
-        Averages score(e1, e2) and score(e2, e1) to ensure symmetry.
+        Args:
+            entity1_embed: First entity embedding (batch, hidden_dim)
+            entity2_embed: Second entity embedding (batch, hidden_dim)
+            temporal_embed: Optional temporal embedding from edge history encoder
+                           (batch, hidden_dim). This should already be symmetric
+                           since it's computed per-edge, not per-entity.
+
+        Returns:
+            Logits of shape (batch,)
         """
-        # Score in both directions
-        logits_12 = super().forward(
-            entity1_embed, entity2_embed, entity1_temporal, entity2_temporal
-        )
+        # Create symmetric pair embedding
+        pair_emb = self.pair_proj(entity1_embed, entity2_embed)
 
-        logits_21 = super().forward(
-            entity2_embed, entity1_embed, entity2_temporal, entity1_temporal
-        )
+        # Add temporal if provided
+        if self.use_temporal and temporal_embed is not None:
+            pair_emb = torch.cat([pair_emb, temporal_embed], dim=-1)
+        elif self.use_temporal:
+            # Pad with zeros if temporal expected but not provided
+            zeros = torch.zeros(
+                pair_emb.size(0), self.hidden_dim, device=pair_emb.device
+            )
+            pair_emb = torch.cat([pair_emb, zeros], dim=-1)
 
-        # Average for symmetry
-        return (logits_12 + logits_21) / 2
+        return self.classifier(pair_emb)

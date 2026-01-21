@@ -137,14 +137,33 @@ class EdgeCentricSubgraphEncoder(nn.Module):
             # 3. Cross-attention: target attends to neighbors
             target_query = target_emb.unsqueeze(1)  # (batch, 1, hidden)
 
+            # Check for fully masked rows (edges with no valid neighbors)
+            # neighbor_mask: True = ignore, so all-True rows mean no valid neighbors
+            if neighbor_mask is not None:
+                fully_masked = neighbor_mask.all(dim=1)  # (batch,)
+
+                # Create a safe mask where fully-masked rows have at least one valid position
+                # This prevents NaN in cross-attention
+                safe_mask = neighbor_mask.clone()
+                safe_mask[fully_masked, 0] = False  # Allow at least one position
+            else:
+                fully_masked = torch.zeros(
+                    batch_size, dtype=torch.bool, device=target_emb.device
+                )
+                safe_mask = None
+
             # MultiheadAttention expects key_padding_mask where True = ignore
             context, attn_weights = self.cross_attention(
                 target_query,
                 neighbor_embs,
                 neighbor_embs,
-                key_padding_mask=neighbor_mask,
+                key_padding_mask=safe_mask,
             )
             context = context.squeeze(1)  # (batch, hidden)
+
+            # For fully masked edges, replace context with zeros (no neighborhood info)
+            if fully_masked.any():
+                context = context.masked_fill(fully_masked.unsqueeze(1), 0.0)
         else:
             # No neighbors - just use target embedding
             context = torch.zeros_like(target_emb)

@@ -1,7 +1,7 @@
 """Transformer decoder for seq2seq edge prediction."""
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -26,104 +26,17 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Add positional encoding to input.
-
-        Args:
-            x: Input tensor of shape (batch, seq_len, d_model)
-
-        Returns:
-            Tensor with positional encoding added
-        """
+        """Add positional encoding to input."""
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
-
-
-class EdgeHistoryEncoder(nn.Module):
-    """
-    Transformer-based encoder for edge state history.
-
-    Uses self-attention over the FULL edge history, allowing the model
-    to learn which historical timesteps are most important for prediction.
-
-    Args:
-        hidden_dim: Output embedding dimension
-        num_heads: Number of attention heads
-        num_layers: Number of transformer encoder layers
-        dropout: Dropout rate
-        max_history_len: Maximum history length for positional encoding
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int = 200,
-        num_heads: int = 4,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        max_history_len: int = 500,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # Project binary state (0/1) to hidden dimension
-        self.input_proj = nn.Linear(1, hidden_dim)
-
-        # Positional encoding for temporal ordering
-        self.pos_encoding = PositionalEncoding(hidden_dim, max_history_len, dropout)
-
-        # Transformer encoder for self-attention over history
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Output: pool temporal dimension and project
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, edge_history: torch.Tensor) -> torch.Tensor:
-        """
-        Encode full edge history into embedding using self-attention.
-
-        Args:
-            edge_history: Binary tensor of shape (num_pairs, num_timesteps)
-                          where 1 = edge ON, 0 = edge OFF at that timestep
-
-        Returns:
-            Edge history embedding of shape (num_pairs, hidden_dim)
-        """
-        # edge_history: (num_pairs, T)
-        # Add feature dimension: (num_pairs, T, 1)
-        x = edge_history.unsqueeze(-1).float()
-
-        # Project to hidden dim: (num_pairs, T, hidden_dim)
-        x = self.input_proj(x)
-
-        # Add positional encoding
-        x = self.pos_encoding(x)
-
-        # Self-attention over full history
-        # Each position can attend to all other positions
-        x = self.transformer(x)  # (num_pairs, T, hidden_dim)
-
-        # Pool: take the last timestep (most recent context)
-        # Alternative: mean pooling or learned pooling
-        output = x[:, -1, :]  # (num_pairs, hidden_dim)
-
-        return self.output_proj(output)
 
 
 class TemporalEdgeDecoder(nn.Module):
     """
     Transformer decoder for predicting edge states across timesteps.
 
-    Takes entity context from encoder and predicts all edges × all timesteps.
+    Uses EdgeCentricSubgraphEncoder as the PRIMARY temporal signal with
+    gated fusion to combine static pair embeddings with edge history context.
 
     Args:
         hidden_dim: Hidden dimension (must match encoder)
@@ -131,7 +44,6 @@ class TemporalEdgeDecoder(nn.Module):
         num_heads: Number of attention heads
         max_timesteps: Maximum number of timesteps to predict
         dropout: Dropout rate
-        use_edge_history: Enable edge-centric subgraph encoder for temporal context
     """
 
     def __init__(
@@ -141,16 +53,19 @@ class TemporalEdgeDecoder(nn.Module):
         num_heads: int = 8,
         max_timesteps: int = 200,
         dropout: float = 0.1,
-        use_edge_history: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.max_timesteps = max_timesteps
-        self.use_edge_history = use_edge_history
 
-        # Pair embedding projection (combine two entity embeddings)
-        self.pair_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        # Symmetric pair projection: sum + product + abs_diff
+        # Output dim: 3 * hidden_dim -> hidden_dim
+        self.pair_proj = nn.Sequential(
+            nn.Linear(3 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
 
         # Relative timestep embedding
         self.timestep_embed = nn.Embedding(max_timesteps, hidden_dim)
@@ -158,16 +73,23 @@ class TemporalEdgeDecoder(nn.Module):
         # Positional encoding for temporal ordering
         self.pos_encoding = PositionalEncoding(hidden_dim, max_timesteps, dropout)
 
-        # Edge history encoder: uses EdgeCentricSubgraphEncoder for N-hop context
-        self.edge_history_encoder = None
-        if use_edge_history:
-            self.edge_history_encoder = EdgeCentricSubgraphEncoder(
-                hidden_dim=hidden_dim,
-                num_heads=4,
-                num_layers=2,
-                max_neighbors=50,
-                dropout=dropout,
-            )
+        # Edge history encoder: PRIMARY temporal signal (always enabled)
+        self.edge_history_encoder = EdgeCentricSubgraphEncoder(
+            hidden_dim=hidden_dim,
+            num_heads=4,
+            num_layers=2,
+            max_neighbors=50,
+            dropout=dropout,
+        )
+
+        # Gated fusion: learn when to use edge history vs pair embedding
+        # Input: [pair_emb, edge_hist_emb] -> gate value
+        self.gate_proj = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid(),
+        )
 
         # Transformer decoder layers
         decoder_layer = nn.TransformerDecoderLayer(
@@ -189,13 +111,23 @@ class TemporalEdgeDecoder(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+    def _symmetric_pair_features(
+        self,
+        e1_embed: torch.Tensor,
+        e2_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Create symmetric pair features from entity embeddings."""
+        pair_sum = e1_embed + e2_embed
+        pair_prod = e1_embed * e2_embed
+        pair_diff = torch.abs(e1_embed - e2_embed)
+        return torch.cat([pair_sum, pair_prod, pair_diff], dim=-1)
+
     def forward(
         self,
         entity_context: torch.Tensor,
         pair_indices: torch.Tensor,
         relative_timesteps: torch.Tensor,
-        edge_history: torch.Tensor = None,
-        subgraph_context: Optional[dict] = None,
+        subgraph_context: dict,
         causal: bool = True,
     ) -> torch.Tensor:
         """
@@ -205,8 +137,7 @@ class TemporalEdgeDecoder(nn.Module):
             entity_context: Entity embeddings from encoder (num_entities, hidden_dim)
             pair_indices: Entity pair indices (num_pairs, 2)
             relative_timesteps: Timesteps relative to train boundary (num_timesteps,)
-            edge_history: Optional edge state history (num_pairs, history_len)
-            subgraph_context: Optional dict with subgraph tensors for EdgeCentricSubgraphEncoder:
+            subgraph_context: Dict with subgraph tensors for EdgeCentricSubgraphEncoder:
                 - target_histories: (num_pairs, num_timesteps) target edge histories
                 - neighbor_histories: (num_pairs, max_neighbors, num_timesteps)
                 - hop_distances: (num_pairs, max_neighbors)
@@ -220,35 +151,35 @@ class TemporalEdgeDecoder(nn.Module):
         num_timesteps = relative_timesteps.size(0)
         device = entity_context.device
 
-        # Build pair embeddings from entity context
+        # Build symmetric pair embeddings from entity context
         e1_ctx = entity_context[pair_indices[:, 0]]  # (num_pairs, hidden)
         e2_ctx = entity_context[pair_indices[:, 1]]  # (num_pairs, hidden)
-        pair_emb = self.pair_proj(torch.cat([e1_ctx, e2_ctx], dim=-1))
+        pair_features = self._symmetric_pair_features(e1_ctx, e2_ctx)
+        pair_emb = self.pair_proj(pair_features)  # (num_pairs, hidden)
 
-        # Add context from edge history encoder (uses subgraph context)
-        if self.edge_history_encoder is not None and subgraph_context is not None:
-            edge_hist_emb = self.edge_history_encoder(
-                target_histories=subgraph_context["target_histories"],
-                neighbor_histories=subgraph_context["neighbor_histories"],
-                hop_distances=subgraph_context["hop_distances"],
-                neighbor_mask=subgraph_context.get("neighbor_mask"),
-            )
-            pair_emb = pair_emb + edge_hist_emb
+        # Get edge temporal context from subgraph encoder (PRIMARY signal)
+        edge_hist_emb = self.edge_history_encoder(
+            target_histories=subgraph_context["target_histories"],
+            neighbor_histories=subgraph_context["neighbor_histories"],
+            hop_distances=subgraph_context["hop_distances"],
+            neighbor_mask=subgraph_context.get("neighbor_mask"),
+        )  # (num_pairs, hidden)
 
-        pair_emb = self.dropout(pair_emb)
+        # Gated fusion: learn balance between static and temporal features
+        gate = self.gate_proj(torch.cat([pair_emb, edge_hist_emb], dim=-1))
+        fused_emb = gate * pair_emb + (1 - gate) * edge_hist_emb
+
+        fused_emb = self.dropout(fused_emb)
 
         # Build temporal queries
-        # Clamp timesteps to valid embedding range
         clamped_t = relative_timesteps.clamp(0, self.max_timesteps - 1)
         t_emb = self.timestep_embed(clamped_t)  # (num_timesteps, hidden)
 
-        # Combine pair + timestep embeddings
-        # (num_pairs, 1, hidden) + (1, num_timesteps, hidden) -> (num_pairs, num_timesteps, hidden)
-        queries = pair_emb.unsqueeze(1) + t_emb.unsqueeze(0)
+        # Combine fused pair + timestep embeddings
+        queries = fused_emb.unsqueeze(1) + t_emb.unsqueeze(0)
         queries = self.pos_encoding(queries)
 
         # Memory: entity context for cross-attention
-        # Expand to (num_pairs, num_entities, hidden)
         memory = entity_context.unsqueeze(0).expand(num_pairs, -1, -1)
 
         # Causal mask for temporal autoregression
@@ -259,12 +190,10 @@ class TemporalEdgeDecoder(nn.Module):
             )
 
         # Decode
-        decoded = self.decoder(
-            queries, memory, tgt_mask=tgt_mask
-        )  # (num_pairs, num_timesteps, hidden)
+        decoded = self.decoder(queries, memory, tgt_mask=tgt_mask)
 
         # Project to logits
-        logits = self.output_proj(decoded).squeeze(-1)  # (num_pairs, num_timesteps)
+        logits = self.output_proj(decoded).squeeze(-1)
 
         return logits
 
@@ -273,10 +202,9 @@ class TemporalEdgeDecoder(nn.Module):
         entity_context: torch.Tensor,
         pair_indices: torch.Tensor,
         relative_timesteps: torch.Tensor,
-        edge_history: torch.Tensor = None,
-        subgraph_context: Optional[dict] = None,
+        subgraph_context: dict,
         threshold: float = 0.5,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Inference mode: returns probabilities and binary predictions.
 
@@ -284,8 +212,7 @@ class TemporalEdgeDecoder(nn.Module):
             entity_context: Entity embeddings from encoder
             pair_indices: Entity pair indices
             relative_timesteps: Timesteps relative to train boundary
-            edge_history: Optional edge state history (num_pairs, history_len)
-            subgraph_context: Optional subgraph context for EdgeCentricSubgraphEncoder
+            subgraph_context: Subgraph context for EdgeCentricSubgraphEncoder
             threshold: Classification threshold
 
         Returns:
@@ -296,7 +223,6 @@ class TemporalEdgeDecoder(nn.Module):
                 entity_context,
                 pair_indices,
                 relative_timesteps,
-                edge_history=edge_history,
                 subgraph_context=subgraph_context,
                 causal=False,
             )
@@ -311,7 +237,6 @@ def create_decoder(
     num_heads: int = 8,
     max_timesteps: int = 200,
     dropout: float = 0.1,
-    use_edge_history: bool = False,
 ) -> TemporalEdgeDecoder:
     """Factory function to create decoder."""
     return TemporalEdgeDecoder(
@@ -320,5 +245,4 @@ def create_decoder(
         num_heads=num_heads,
         max_timesteps=max_timesteps,
         dropout=dropout,
-        use_edge_history=use_edge_history,
     )

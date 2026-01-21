@@ -218,12 +218,116 @@ class PPIDataModule:
 
     @property
     def full_graphs(self) -> Optional[Dict]:
-        """Lazy-load full graphs (inter + intra) per timestep."""
+        """Lazy-load full graphs (inter + intra) per timestep, remapped to train IDs."""
         if self._full_graphs is None:
             path = self.data_path / "full_graphs.pt"
             if path.exists():
-                self._full_graphs = torch.load(path)
+                raw_graphs = torch.load(path)
+                # Remap to match train dataset entity IDs
+                self._full_graphs = self._remap_full_graphs(raw_graphs)
         return self._full_graphs
+
+    def _remap_full_graphs(self, raw_graphs: Dict) -> Dict:
+        """
+        Remap full_graphs entity IDs to be compatible with train dataset IDs.
+
+        The design intent is:
+        - Predict ONLY interchain interactions (using train IDs 0 to num_interchain-1)
+        - Use BOTH interchain AND intrachain edges for neighborhood context
+
+        This method:
+        1. Maps interchain entities to their train.txt IDs (0-53)
+        2. Assigns new IDs (54+) for intrachain-only entities
+        3. Keeps ALL edges (inter + intra) for subgraph context enrichment
+        """
+        import json
+
+        # Load global entity_to_id from metadata
+        metadata_path = self.data_path / "metadata.json"
+        if not metadata_path.exists():
+            print("Warning: metadata.json not found, cannot remap full_graphs")
+            return raw_graphs
+
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+
+        global_e2id = metadata.get("entity_to_id", {})
+        if not global_e2id:
+            return raw_graphs
+
+        global_id2e = {v: k for k, v in global_e2id.items()}
+
+        # Step 1: Identify interchain entities from full_graphs
+        interchain_global_ids = set()
+        all_global_ids = set()
+        for t, graph_data in raw_graphs.items():
+            src = graph_data["src"].tolist()
+            dst = graph_data["dst"].tolist()
+            is_inter = graph_data.get(
+                "is_inter", torch.ones(len(src), dtype=torch.bool)
+            )
+            if hasattr(is_inter, "tolist"):
+                is_inter = is_inter.tolist()
+
+            for s, d, inter in zip(src, dst, is_inter):
+                all_global_ids.add(s)
+                all_global_ids.add(d)
+                if inter:
+                    interchain_global_ids.add(s)
+                    interchain_global_ids.add(d)
+
+        # Step 2: Build mapping for interchain entities (sorted to match preprocessing)
+        # These map to train IDs 0 to len(interchain)-1
+        sorted_interchain_globals = sorted(interchain_global_ids)
+        global_to_local = {g: i for i, g in enumerate(sorted_interchain_globals)}
+
+        # Step 3: Assign IDs for intrachain-only entities (starting after interchain)
+        next_local_id = len(sorted_interchain_globals)
+        intrachain_only_globals = all_global_ids - interchain_global_ids
+        for g in sorted(intrachain_only_globals):
+            global_to_local[g] = next_local_id
+            next_local_id += 1
+
+        # Step 4: Remap ALL edges (keeping both inter and intra for context)
+        remapped = {}
+        for t, graph_data in raw_graphs.items():
+            src = graph_data["src"]
+            dst = graph_data["dst"]
+            is_inter = graph_data.get(
+                "is_inter", torch.ones(len(src), dtype=torch.bool)
+            )
+
+            new_src = []
+            new_dst = []
+            new_is_inter = []
+
+            for i in range(len(src)):
+                s, d = src[i].item(), dst[i].item()
+                inter = (
+                    is_inter[i].item() if hasattr(is_inter[i], "item") else is_inter[i]
+                )
+
+                if s in global_to_local and d in global_to_local:
+                    new_src.append(global_to_local[s])
+                    new_dst.append(global_to_local[d])
+                    new_is_inter.append(inter)
+
+            if new_src:
+                remapped[t] = {
+                    "src": torch.tensor(new_src, dtype=torch.long),
+                    "dst": torch.tensor(new_dst, dtype=torch.long),
+                    "is_inter": torch.tensor(new_is_inter, dtype=torch.bool),
+                }
+
+        # Log for debugging
+        num_interchain = len(sorted_interchain_globals)
+        num_intrachain_only = len(intrachain_only_globals)
+        print(
+            f"  Entity mapping: {num_interchain} interchain (IDs 0-{num_interchain - 1}), "
+            f"{num_intrachain_only} intrachain-only (IDs {num_interchain}-{next_local_id - 1})"
+        )
+
+        return remapped
 
     @property
     def subgraph_extractor(self):
