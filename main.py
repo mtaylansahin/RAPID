@@ -371,10 +371,16 @@ def run_evaluate(args) -> bool:
     encoder = RAPIDEncoder(rapid_model, freeze=True)
 
     # Create decoder (always uses EdgeCentricSubgraphEncoder)
+    # Use CLI override for decoder_heads if provided (for old checkpoints)
+    num_heads = (
+        args.decoder_heads
+        if hasattr(args, "decoder_heads") and args.decoder_heads is not None
+        else decoder_config.get("num_heads", 8)
+    )
     decoder = create_decoder(
         hidden_dim=hidden_dim,
         num_layers=decoder_config.get("num_layers", 4),
-        num_heads=8,
+        num_heads=num_heads,
         max_timesteps=decoder_config.get("max_timesteps", 200),
         dropout=0.1,
     )
@@ -527,6 +533,12 @@ def main():
     )
     eval_parser.add_argument(
         "--no_node_features", action="store_true", help="Disable node features"
+    )
+    eval_parser.add_argument(
+        "--decoder_heads",
+        type=int,
+        default=None,
+        help="Override decoder attention heads (for checkpoints missing this config)",
     )
 
     # === All command ===

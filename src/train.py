@@ -360,6 +360,11 @@ class Trainer:
                 "num_entities": self.encoder.num_entities,
                 "decoder": {
                     "num_layers": self.decoder.num_layers,
+                    "num_heads": getattr(self.decoder, "decoder", None)
+                    .layers[0]
+                    .self_attn.num_heads
+                    if hasattr(self.decoder, "decoder")
+                    else 8,
                     "max_timesteps": self.decoder.max_timesteps,
                 },
             },
