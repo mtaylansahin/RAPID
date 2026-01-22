@@ -201,7 +201,9 @@ class RAPIDModel(nn.Module):
         self._entity_history = [h.copy() for h in entity_history]
         self._entity_history_t = [t.copy() for t in entity_history_t]
         self._global_emb = global_emb.copy() if global_emb else {}
-        self._global_model = global_model
+        # Use object.__setattr__ to avoid PyTorch registering this as a submodule
+        # (which would cause it to be saved in state_dict)
+        object.__setattr__(self, "_global_model", global_model)
 
     def _get_entity_temporal_embed(
         self,

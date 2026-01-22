@@ -372,7 +372,12 @@ def run_evaluate(args) -> bool:
         config=model_config,
         node_features=node_features,
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Filter out _global_model keys if present (bug in older checkpoints)
+    state_dict = checkpoint["model_state_dict"]
+    state_dict = {
+        k: v for k, v in state_dict.items() if not k.startswith("_global_model")
+    }
+    model.load_state_dict(state_dict)
 
     # Get threshold (from checkpoint)
     threshold = checkpoint.get("optimal_threshold", 0.5)
