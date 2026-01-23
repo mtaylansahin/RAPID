@@ -404,8 +404,19 @@ def run_evaluate(args) -> bool:
     predictions_path = predictions_dir / "predictions.txt"
 
     # Run evaluation
-    evaluator.full_evaluation()
+    eval_results = evaluator.full_evaluation()
     evaluator.save_predictions(predictions_path)
+
+    # Save evaluation results including transition metrics
+    import json
+
+    eval_results_path = (
+        Path(args.predictions_dir) / args.dataset / "evaluation_results.json"
+    )
+    eval_results_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(eval_results_path, "w") as f:
+        json.dump(eval_results, f, indent=2)
+    print(f"Evaluation results saved to: {eval_results_path}")
 
     # Run analysis + visualization
     analysis_output_dir = Path("analysis_outputs") / Path(checkpoint_path).parent.name

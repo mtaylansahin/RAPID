@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from tqdm import tqdm
@@ -10,7 +10,12 @@ from tqdm import tqdm
 from src.config import TrainingConfig
 from src.data.dataset import PPIDataModule
 from src.losses import get_loss_function
-from src.metrics import ClassificationMetrics, MetricsComputer
+from src.metrics import (
+    ClassificationMetrics,
+    MetricsComputer,
+    TransitionMetrics,
+    compute_transition_metrics,
+)
 from src.models.decoder import TemporalEdgeDecoder
 from src.models.encoder import RAPIDEncoder
 
@@ -82,6 +87,9 @@ class Trainer:
             "train_loss": [],
             "val_auprc": [],
             "val_f1": [],
+            "val_trans_acc": [],
+            "val_off_to_on_recall": [],
+            "val_on_to_off_recall": [],
         }
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -248,8 +256,8 @@ class Trainer:
         return total_loss / num_batches
 
     @torch.no_grad()
-    def validate(self) -> ClassificationMetrics:
-        """Validate on test timesteps."""
+    def validate(self) -> Tuple[ClassificationMetrics, TransitionMetrics]:
+        """Validate on test timesteps, returning both classification and transition metrics."""
         self.encoder.eval()
         self.decoder.eval()
 
@@ -258,6 +266,11 @@ class Trainer:
 
         # Get test targets
         target_matrix = self._get_target_matrix(self.test_timesteps, "test").to(
+            self.device
+        )
+
+        # Get previous states for transition metrics
+        prev_states = self._get_previous_states(self.test_timesteps, "test").to(
             self.device
         )
 
@@ -289,13 +302,22 @@ class Trainer:
 
         all_logits = torch.cat(all_logits, dim=0)
 
-        # Flatten for metrics
+        # Flatten for classification metrics
         logits_flat = all_logits.view(-1)
         targets_flat = target_matrix.view(-1).cpu()
 
         metrics_computer = MetricsComputer()
         metrics_computer.update(logits_flat, targets_flat)
-        return metrics_computer.compute(tune_threshold=True)
+        cls_metrics = metrics_computer.compute(tune_threshold=True)
+
+        # Compute transition metrics
+        probs = torch.sigmoid(all_logits)
+        predictions = (probs >= cls_metrics.threshold).long()
+        trans_metrics = compute_transition_metrics(
+            predictions, target_matrix.cpu().long(), prev_states[:, 0].cpu().long()
+        )
+
+        return cls_metrics, trans_metrics
 
     def train(self) -> Dict[str, Any]:
         """Full training loop."""
@@ -313,13 +335,23 @@ class Trainer:
             self.history["train_loss"].append(train_loss)
 
             if epoch % self.config.eval_interval == 0:
-                val_metrics = self.validate()
+                val_metrics, trans_metrics = self.validate()
                 self.history["val_auprc"].append(val_metrics.auprc)
                 self.history["val_f1"].append(val_metrics.f1)
+                self.history["val_trans_acc"].append(trans_metrics.transition_accuracy)
+                self.history["val_off_to_on_recall"].append(
+                    trans_metrics.off_to_on_recall
+                )
+                self.history["val_on_to_off_recall"].append(
+                    trans_metrics.on_to_off_recall
+                )
 
                 print(
                     f"Epoch {epoch:03d} | Loss: {train_loss:.4f} | "
-                    f"{val_metrics.short_str()}"
+                    f"{val_metrics.short_str()} | "
+                    f"TransAcc: {trans_metrics.transition_accuracy:.3f} "
+                    f"(0→1: {trans_metrics.off_to_on_recall:.3f}, "
+                    f"1→0: {trans_metrics.on_to_off_recall:.3f})"
                 )
 
                 if val_metrics.auprc > self.best_val_auprc:
